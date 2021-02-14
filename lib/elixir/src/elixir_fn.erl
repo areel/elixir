@@ -1,156 +1,190 @@
 -module(elixir_fn).
--export([fn/3, capture/3]).
--import(elixir_scope, [umergec/2]).
--import(elixir_errors, [syntax_error/3, syntax_error/4, compile_error/4]).
+-export([capture/3, expand/3, format_error/1]).
+-import(elixir_errors, [form_error/4]).
 -include("elixir.hrl").
 
-fn(Meta, Clauses, S) ->
-  Transformer = fun({ ArgsWithGuards, CMeta, Expr }, Acc) ->
-    { Args, Guards } = elixir_clauses:extract_splat_guards(ArgsWithGuards),
-    elixir_clauses:assigns_block(?line(CMeta), fun translate_fn_match/2, Args, [Expr], Guards, umergec(S, Acc))
+%% Anonymous functions
+
+expand(Meta, Clauses, E) when is_list(Clauses) ->
+  Transformer = fun({_, _, [Left, _Right]} = Clause, Acc) ->
+    case lists:any(fun is_invalid_arg/1, Left) of
+      true ->
+        form_error(Meta, E, ?MODULE, defaults_in_args);
+      false ->
+        EReset = elixir_env:reset_unused_vars(Acc),
+        {EClause, EAcc} = elixir_clauses:clause(Meta, fn, fun elixir_clauses:head/2, Clause, EReset),
+        {EClause, elixir_env:merge_and_check_unused_vars(Acc, EAcc)}
+    end
   end,
 
-  { TClauses, NS } = lists:mapfoldl(Transformer, S, Clauses),
-  Arities = [length(Args) || { clause, _Line, Args, _Guards, _Exprs } <- TClauses],
+  {EClauses, EE} = lists:mapfoldl(Transformer, E, Clauses),
+  EArities = [fn_arity(Args) || {'->', _, [Args, _]} <- EClauses],
 
-  case length(lists:usort(Arities)) of
-    1 ->
-      { { 'fun', ?line(Meta), { clauses, TClauses } }, umergec(S, NS) };
+  case lists:usort(EArities) of
+    [_] ->
+      {{fn, Meta, EClauses}, EE};
     _ ->
-      syntax_error(Meta, S#elixir_scope.file,
-                   "cannot mix clauses with different arities in function definition")
+      form_error(Meta, E, ?MODULE, clauses_with_different_arities)
   end.
 
-translate_fn_match(Arg, S) ->
-  { TArg, TS } = elixir_translator:translate(Arg, S#elixir_scope{extra=fn_match}),
-  { TArg, TS#elixir_scope{extra=S#elixir_scope.extra} }.
+is_invalid_arg({'\\\\', _, _}) -> true;
+is_invalid_arg(_) -> false.
 
-capture(Meta, { '/', _, [{ { '.', _, [_, F] } = Dot, RequireMeta , [] }, A] }, S) when is_atom(F), is_integer(A) ->
-  Args = [{ '&', [], [X] } || X <- lists:seq(1, A)],
-  capture_require(Meta, { Dot, RequireMeta, Args }, S, true);
+fn_arity([{'when', _, Args}]) -> length(Args) - 1;
+fn_arity(Args) -> length(Args).
 
-capture(Meta, { '/', _, [{ F, _, C }, A] }, S) when is_atom(F), is_integer(A), is_atom(C) ->
-  ImportMeta =
-    case lists:keyfind(import_fa, 1, Meta) of
-      { import_fa, { Receiver, Context } } ->
-        lists:keystore(context, 1,
-          lists:keystore(import, 1, Meta, { import, Receiver }),
-          { context, Context }
-        );
-      false -> Meta
-    end,
-  Args = [{ '&', [], [X] } || X <- lists:seq(1, A)],
-  capture_import(Meta, { F, ImportMeta, Args }, S, true);
+%% Capture
 
-capture(Meta, { { '.', _, [_, Fun] }, _, Args } = Expr, S) when is_atom(Fun), is_list(Args) ->
-  capture_require(Meta, Expr, S, is_sequential_and_not_empty(Args));
+capture(Meta, {'/', _, [{{'.', _, [M, F]} = Dot, DotMeta, []}, A]}, E) when is_atom(F), is_integer(A) ->
+  Args = args_from_arity(Meta, A, E),
+  handle_capture_possible_warning(Meta, DotMeta, M, F, A, E),
+  capture_require(Meta, {Dot, Meta, Args}, E, true);
 
-capture(Meta, { { '.', _, [_] }, _, Args } = Expr, S) when is_list(Args) ->
-  do_capture(Meta, Expr, S, false);
+capture(Meta, {'/', _, [{F, _, C}, A]}, E) when is_atom(F), is_integer(A), is_atom(C) ->
+  Args = args_from_arity(Meta, A, E),
+  capture_import(Meta, {F, Meta, Args}, E, true);
 
-capture(Meta, { '__block__', _, _ } = Expr, S) ->
-  Message = "invalid args for &, block expressions are not allowed, got: ~ts",
-  syntax_error(Meta, S#elixir_scope.file, Message, ['Elixir.Macro':to_string(Expr)]);
+capture(Meta, {{'.', _, [_, Fun]}, _, Args} = Expr, E) when is_atom(Fun), is_list(Args) ->
+  capture_require(Meta, Expr, E, is_sequential_and_not_empty(Args));
 
-capture(Meta, { Atom, _, Args } = Expr, S) when is_atom(Atom), is_list(Args) ->
-  capture_import(Meta, Expr, S, is_sequential_and_not_empty(Args));
+capture(Meta, {{'.', _, [_]}, _, Args} = Expr, E) when is_list(Args) ->
+  capture_expr(Meta, Expr, E, false);
 
-capture(Meta, { Left, Right }, S) ->
-  capture(Meta, { '{}', Meta, [Left, Right] }, S);
+capture(Meta, {'__block__', _, [Expr]}, E) ->
+  capture(Meta, Expr, E);
 
-capture(Meta, List, S) when is_list(List) ->
-  capture(Meta, { '[]', Meta, List }, S);
+capture(Meta, {'__block__', _, _} = Expr, E) ->
+  form_error(Meta, E, ?MODULE, {block_expr_in_capture, Expr});
 
-capture(Meta, Arg, S) when is_integer(Arg) ->
-  compile_error(Meta, S#elixir_scope.file, "unhandled &~B outside of a capture", [Arg]);
+capture(Meta, {Atom, _, Args} = Expr, E) when is_atom(Atom), is_list(Args) ->
+  capture_import(Meta, Expr, E, is_sequential_and_not_empty(Args));
 
-capture(Meta, Arg, S) ->
-  invalid_capture(Meta, Arg, S).
+capture(Meta, {Left, Right}, E) ->
+  capture(Meta, {'{}', Meta, [Left, Right]}, E);
 
-%% Helpers
+capture(Meta, List, E) when is_list(List) ->
+  capture_expr(Meta, List, E, is_sequential_and_not_empty(List));
 
-capture_import(Meta, { Atom, ImportMeta, Args } = Expr, S, Sequential) ->
-  case Sequential andalso
-       elixir_dispatch:import_function(ImportMeta, Atom, length(Args), S) of
-    false -> do_capture(Meta, Expr, S, Sequential);
-    Else  -> Else
+capture(Meta, Integer, E) when is_integer(Integer) ->
+  form_error(Meta, E, ?MODULE, {capture_arg_outside_of_capture, Integer});
+
+capture(Meta, Arg, E) ->
+  invalid_capture(Meta, Arg, E).
+
+capture_import(Meta, {Atom, ImportMeta, Args} = Expr, E, Sequential) ->
+  Res = Sequential andalso
+        elixir_dispatch:import_function(ImportMeta, Atom, length(Args), E),
+  handle_capture(Res, Meta, Expr, E, Sequential).
+
+capture_require(Meta, {{'.', DotMeta, [Left, Right]}, RequireMeta, Args}, E, Sequential) ->
+  case escape(Left, E, []) of
+    {EscLeft, []} ->
+      {ELeft, EE} = elixir_expand:expand(EscLeft, E),
+      Res = Sequential andalso case ELeft of
+        {Name, _, Context} when is_atom(Name), is_atom(Context) ->
+          {remote, ELeft, Right, length(Args)};
+        _ when is_atom(ELeft) ->
+          elixir_dispatch:require_function(RequireMeta, ELeft, Right, length(Args), EE);
+        _ ->
+          false
+      end,
+      handle_capture(Res, Meta, {{'.', DotMeta, [ELeft, Right]}, RequireMeta, Args},
+                     EE, Sequential);
+    {EscLeft, Escaped} ->
+      capture_expr(Meta, {{'.', DotMeta, [EscLeft, Right]}, RequireMeta, Args},
+                   E, Escaped, Sequential)
   end.
 
-capture_require(Meta, { { '.', _, [Left, Right] }, RequireMeta, Args } = Expr, S, Sequential) ->
-  { Mod, SE } = 'Elixir.Macro':expand_all(Left, elixir_scope:to_ex_env({ ?line(Meta), S }), S),
+handle_capture(false, Meta, Expr, E, Sequential) ->
+  capture_expr(Meta, Expr, E, Sequential);
+handle_capture(LocalOrRemote, _Meta, _Expr, E, _Sequential) ->
+  {LocalOrRemote, E}.
 
-  case Sequential andalso is_atom(Mod) andalso
-       elixir_dispatch:require_function(RequireMeta, Mod, Right, length(Args), SE) of
-    false -> do_capture(Meta, Expr, S, Sequential);
-    Else  -> Else
+capture_expr(Meta, Expr, E, Sequential) ->
+  capture_expr(Meta, Expr, E, [], Sequential).
+capture_expr(Meta, Expr, E, Escaped, Sequential) ->
+  case escape(Expr, E, Escaped) of
+    {_, []} when not Sequential ->
+      invalid_capture(Meta, Expr, E);
+    {EExpr, EDict} ->
+      EVars = validate(Meta, EDict, 1, E),
+      Fn = {fn, Meta, [{'->', Meta, [EVars, EExpr]}]},
+      {expand, Fn, E}
   end.
 
-do_capture(Meta, Expr, S, Sequential) ->
-  case do_escape(Expr, S, []) of
-    { _, _, [] } when not Sequential ->
-      invalid_capture(Meta, Expr, S);
-    { TExpr, TS, TDict } ->
-      TVars = validate(Meta, TDict, 1, S),
-      fn(Meta, [{ TVars, Meta, TExpr }], TS)
-  end.
+invalid_capture(Meta, Arg, E) ->
+  form_error(Meta, E, ?MODULE, {invalid_args_for_capture, Arg}).
 
-invalid_capture(Meta, Arg, S) ->
-  Message = "invalid args for &, expected an expression in the format of &Mod.fun/arity, "
-            "&local/arity or a capture containing at least one argument as &1, got: ~ts",
-  syntax_error(Meta, S#elixir_scope.file, Message, ['Elixir.Macro':to_string(Arg)]).
-
-validate(Meta, [{ Pos, Var }|T], Pos, S) ->
-  [Var|validate(Meta, T, Pos + 1, S)];
-
-validate(Meta, [{ Pos, _ }|_], Expected, S) ->
-  compile_error(Meta, S#elixir_scope.file, "capture &~B cannot be defined without &~B", [Pos, Expected]);
-
-validate(_Meta, [], _Pos, _S) ->
+validate(Meta, [{Pos, Var} | T], Pos, E) ->
+  [Var | validate(Meta, T, Pos + 1, E)];
+validate(Meta, [{Pos, _} | _], Expected, E) ->
+  form_error(Meta, E, ?MODULE, {capture_arg_without_predecessor, Pos, Expected});
+validate(_Meta, [], _Pos, _E) ->
   [].
 
-do_escape({ '&', Meta, [Pos] }, S, Dict) when is_integer(Pos), Pos > 0 ->
-  case orddict:find(Pos, Dict) of
-    { ok, Var } ->
-      { Var, S, Dict };
-    error ->
-      { Var, SC } = elixir_scope:build_ex_var(?line(Meta), S),
-      { Var, SC, orddict:store(Pos, Var, Dict) }
-  end;
+escape({'&', _, [Pos]}, _E, Dict) when is_integer(Pos), Pos > 0 ->
+  Var = {list_to_atom([$x | integer_to_list(Pos)]), [], ?var_context},
+  {Var, orddict:store(Pos, Var, Dict)};
+escape({'&', Meta, [Pos]}, E, _Dict) when is_integer(Pos) ->
+  form_error(Meta, E, ?MODULE, {unallowed_capture_arg, Pos});
+escape({'&', Meta, _} = Arg, E, _Dict) ->
+  form_error(Meta, E, ?MODULE, {nested_capture, Arg});
+escape({Left, Meta, Right}, E, Dict0) ->
+  {TLeft, Dict1}  = escape(Left, E, Dict0),
+  {TRight, Dict2} = escape(Right, E, Dict1),
+  {{TLeft, Meta, TRight}, Dict2};
+escape({Left, Right}, E, Dict0) ->
+  {TLeft, Dict1}  = escape(Left, E, Dict0),
+  {TRight, Dict2} = escape(Right, E, Dict1),
+  {{TLeft, TRight}, Dict2};
+escape(List, E, Dict) when is_list(List) ->
+  lists:mapfoldl(fun(X, Acc) -> escape(X, E, Acc) end, Dict, List);
+escape(Other, _E, Dict) ->
+  {Other, Dict}.
 
-do_escape({ '&', Meta, [Pos] }, S, _Dict) when is_integer(Pos) ->
-  compile_error(Meta, S#elixir_scope.file, "capture &~B is not allowed", [Pos]);
-
-do_escape({ '&', Meta, _ } = Arg, S, _Dict) ->
-  Message = "nested captures via & are not allowed: ~ts",
-  compile_error(Meta, S#elixir_scope.file, Message, ['Elixir.Macro':to_string(Arg)]);
-
-do_escape({ Left, Meta, Right }, S0, Dict0) ->
-  { TLeft, S1, Dict1 }  = do_escape(Left, S0, Dict0),
-  { TRight, S2, Dict2 } = do_escape(Right, S1, Dict1),
-  { { TLeft, Meta, TRight }, S2, Dict2 };
-
-do_escape({ Left, Right }, S0, Dict0) ->
-  { TLeft, S1, Dict1 }  = do_escape(Left, S0, Dict0),
-  { TRight, S2, Dict2 } = do_escape(Right, S1, Dict1),
-  { { TLeft, TRight }, S2, Dict2 };
-
-do_escape(List, S, Dict) when is_list(List) ->
-  do_escape_list(List, S, Dict, []);
-
-do_escape(Other, S, Dict) ->
-  { Other, S, Dict }.
-
-do_escape_list([H|T], S, Dict, Acc) ->
-  { TH, TS, TDict } = do_escape(H, S, Dict),
-  do_escape_list(T, TS, TDict, [TH|Acc]);
-
-do_escape_list([], S, Dict, Acc) ->
-  { lists:reverse(Acc), S, Dict }.
+args_from_arity(_Meta, A, _E) when is_integer(A), A >= 0, A =< 255 ->
+  [{'&', [], [X]} || X <- lists:seq(1, A)];
+args_from_arity(Meta, A, E) ->
+  form_error(Meta, E, ?MODULE, {invalid_arity_for_capture, A}).
 
 is_sequential_and_not_empty([])   -> false;
 is_sequential_and_not_empty(List) -> is_sequential(List, 1).
 
-is_sequential([{ '&', _, [Int] }|T], Int) ->
-  is_sequential(T, Int + 1);
+is_sequential([{'&', _, [Int]} | T], Int) -> is_sequential(T, Int + 1);
 is_sequential([], _Int) -> true;
 is_sequential(_, _Int) -> false.
+
+handle_capture_possible_warning(Meta, DotMeta, Mod, Fun, Arity, E) ->
+  case (Arity =:= 0) andalso (lists:keyfind(no_parens, 1, DotMeta) /= {no_parens, true}) of
+    true ->
+      elixir_errors:form_warn(Meta, E, ?MODULE, {parens_remote_capture, Mod, Fun});
+
+    false -> ok
+  end.
+
+format_error({parens_remote_capture, Mod, Fun}) ->
+  io_lib:format("extra parentheses on a remote function capture &~ts.~ts()/0 have been "
+                 "deprecated. Please remove the parentheses: &~ts.~ts/0",
+                 ['Elixir.Macro':to_string(Mod), Fun, 'Elixir.Macro':to_string(Mod), Fun]);
+format_error(clauses_with_different_arities) ->
+  "cannot mix clauses with different arities in anonymous functions";
+format_error(defaults_in_args) ->
+  "anonymous functions cannot have optional arguments";
+format_error({block_expr_in_capture, Expr}) ->
+  io_lib:format("invalid args for &, block expressions are not allowed, got: ~ts",
+                ['Elixir.Macro':to_string(Expr)]);
+format_error({nested_capture, Arg}) ->
+  io_lib:format("nested captures via & are not allowed: ~ts", ['Elixir.Macro':to_string(Arg)]);
+format_error({invalid_arity_for_capture, Arity}) ->
+  io_lib:format("invalid arity for &, expected a number between 0 and 255, got: ~b", [Arity]);
+format_error({capture_arg_outside_of_capture, Integer}) ->
+  io_lib:format("unhandled &~B outside of a capture", [Integer]);
+format_error({capture_arg_without_predecessor, Pos, Expected}) ->
+  io_lib:format("capture &~B cannot be defined without &~B", [Pos, Expected]);
+format_error({unallowed_capture_arg, Integer}) ->
+  io_lib:format("capture &~B is not allowed", [Integer]);
+format_error({invalid_args_for_capture, Arg}) ->
+  Message =
+    "invalid args for &, expected an expression in the format of &Mod.fun/arity, "
+    "&local/arity or a capture containing at least one argument as &1, got: ~ts",
+  io_lib:format(Message, ['Elixir.Macro':to_string(Arg)]).

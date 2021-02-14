@@ -15,7 +15,7 @@
 #    bug has arisen;
 #
 # 2. In some situations, connecting to a remote node via --remsh
-#    is not possible. This can be tested by starting two iex nodes:
+#    is not possible. This can be tested by starting two IEx nodes:
 #
 #      $ iex --sname foo
 #      $ iex --sname bar --remsh foo@localhost
@@ -24,14 +24,14 @@
 #    are processed on the local node and not the remote one. For such,
 #    one can replace the last line above by:
 #
-#      $ iex --sname bar --remsh foo@localhost -e IO.inspect node
+#      $ iex --sname bar --remsh foo@localhost -e 'IO.inspect node()'
 #
 #    And verify that the local node name is printed.
 #
-# 4. Finally, in some other circunstances, printing messages may become
+# 4. Finally, in some other circumstances, printing messages may become
 #    borked. This can be verified with:
 #
-#      $ iex -e ":error_logger.info_msg("foo~nbar", [])"
+#      $ iex -e ":logger.info('foo~nbar', [])"
 #
 # By the time those instructions have been written, all tests above pass.
 defmodule IEx.CLI do
@@ -50,13 +50,27 @@ defmodule IEx.CLI do
   a dumb terminal version is started instead.
   """
   def start do
-    if tty_works? do
-      :user_drv.start([:"tty_sl -c -e", tty_args])
+    if tty_works?() do
+      :user_drv.start([:"tty_sl -c -e", tty_args()])
     else
-      :user.start
-      IO.puts "Warning: could not run smart terminal, falling back to dumb one"
-      local_start()
+      if get_remsh(:init.get_plain_arguments()) do
+        IO.puts(
+          :stderr,
+          "warning: the --remsh option will be ignored because IEx is running on limited shell"
+        )
+      end
+
+      :user.start()
+
+      # IEx.Broker is capable of considering all groups under user_drv but
+      # when we use :user.start(), we need to explicitly register it instead.
+      # If we don't register, pry doesn't work.
+      IEx.start([register: true] ++ options(), {:elixir, :start_cli, []})
     end
+  end
+
+  def prompt(_n) do
+    []
   end
 
   # Check if tty works. If it does not, we fall back to the
@@ -65,7 +79,7 @@ defmodule IEx.CLI do
   # to do it just once.
   defp tty_works? do
     try do
-      port = Port.open { :spawn, :"tty_sl -c -e" }, [:eof]
+      port = Port.open({:spawn, 'tty_sl -c -e'}, [:eof])
       Port.close(port)
     catch
       _, _ -> false
@@ -73,54 +87,64 @@ defmodule IEx.CLI do
   end
 
   defp tty_args do
-    if remote = get_remsh(:init.get_plain_arguments) do
-      if is_alive do
-        case :rpc.call remote, :code, :ensure_loaded, [IEx] do
-          { :badrpc, reason } ->
-            abort "Could not contact remote node #{remote}, reason: #{inspect reason}. Aborting..."
-          { :module, IEx } ->
-            { remote, :erlang, :apply, [remote_start_function, []] }
+    if remote = get_remsh(:init.get_plain_arguments()) do
+      if Node.alive?() do
+        case :rpc.call(remote, :code, :ensure_loaded, [IEx]) do
+          {:badrpc, reason} ->
+            message =
+              "Could not contact remote node #{remote}, reason: #{inspect(reason)}. Aborting..."
+
+            abort(message)
+
+          {:module, IEx} ->
+            case :rpc.call(remote, :net_kernel, :get_net_ticktime, []) do
+              seconds when is_integer(seconds) -> :net_kernel.set_net_ticktime(seconds)
+              _ -> :ok
+            end
+
+            {mod, fun, args} = remote_start_mfa()
+            {remote, mod, fun, args}
+
           _ ->
-            abort "Could not find IEx on remote node #{remote}. Aborting..."
+            abort("Could not find IEx on remote node #{remote}. Aborting...")
         end
       else
-        abort "In order to use --remsh, you need to name the current node using --name or --sname. Aborting..."
+        abort(
+          "In order to use --remsh, you need to name the current node using --name or --sname. Aborting..."
+        )
       end
     else
-      { :erlang, :apply, [local_start_function, []] }
+      local_start_mfa()
     end
   end
 
-  def local_start do
-    IEx.start(config(), fn -> :elixir.start_cli end)
+  def remote_start(parent, ref) do
+    send(parent, {:begin, ref, self()})
+    receive do: ({:done, ^ref} -> :ok)
   end
 
-  defp local_start_function do
-    &local_start/0
+  defp local_start_mfa do
+    {IEx, :start, [options(), {:elixir, :start_cli, []}]}
   end
 
-  defp remote_start_function do
-    ref    = make_ref
-    config = config()
+  defp remote_start_mfa do
+    ref = make_ref()
+    opts = options()
 
-    parent = spawn_link fn ->
-      receive do
-        { :begin, ^ref, other } ->
-          :elixir.start_cli
-          other <- { :done, ref }
-      end
-    end
-
-    fn ->
-      IEx.start(config, fn ->
-        parent <- { :begin, ref, self }
-        receive do: ({ :done, ^ref } -> :ok)
+    parent =
+      spawn_link(fn ->
+        receive do
+          {:begin, ^ref, other} ->
+            :elixir.start_cli()
+            send(other, {:done, ref})
+        end
       end)
-    end
+
+    {IEx, :start, [opts, {__MODULE__, :remote_start, [parent, ref]}]}
   end
 
-  defp config do
-    [dot_iex_path: find_dot_iex(:init.get_plain_arguments)]
+  defp options do
+    [dot_iex_path: find_dot_iex(:init.get_plain_arguments()), on_eof: :halt]
   end
 
   defp abort(msg) do
@@ -128,14 +152,22 @@ defmodule IEx.CLI do
       IO.puts(:stderr, msg)
       System.halt(1)
     end
-    { :erlang, :apply, [function, []] }
+
+    {:erlang, :apply, [function, []]}
   end
 
-  defp find_dot_iex(['--dot-iex', h|_]), do: String.from_char_list!(h)
-  defp find_dot_iex([_|t]), do: find_dot_iex(t)
+  defp find_dot_iex(['--dot-iex', h | _]), do: List.to_string(h)
+  defp find_dot_iex([_ | t]), do: find_dot_iex(t)
   defp find_dot_iex([]), do: nil
 
-  defp get_remsh(['--remsh', h|_]), do: list_to_atom(h)
-  defp get_remsh([_|t]), do: get_remsh(t)
+  defp get_remsh(['--remsh', h | _]), do: List.to_atom(append_hostname(h))
+  defp get_remsh([_ | t]), do: get_remsh(t)
   defp get_remsh([]), do: nil
+
+  defp append_hostname(node) do
+    case :string.find(node, '@') do
+      :nomatch -> node ++ :string.find(Atom.to_charlist(node()), '@')
+      _ -> node
+    end
+  end
 end

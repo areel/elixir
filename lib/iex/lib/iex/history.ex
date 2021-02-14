@@ -1,136 +1,126 @@
 defmodule IEx.History do
   @moduledoc false
 
+  alias IEx.History
+
+  defstruct queue: :queue.new(), size: 0, start: 1
+
   @doc """
-  Initializes IEx process variables. All history
-  information is kept in the process dictionary.
+  Initializes IEx history state.
   """
-  def init do
-    Process.put(:iex_history_start_counter, 1)
-    Process.put(:iex_history_counter, 1)
+  def init(), do: %History{}
+
+  @doc """
+  Appends one entry to the history.
+  """
+  def append(%History{} = state, entry, limit) do
+    {collect?, state} =
+      state
+      |> append(entry)
+      |> prune(limit)
+
+    if collect?, do: collect_garbage()
+    state
   end
 
   @doc """
-  Appends one entry to the history with the given counter.
+  Enumerates over all items in the history starting from the oldest one and
+  applies `fun` to each one in turn.
   """
-  def append(entry, counter) do
-    Process.put({:iex_history, counter}, entry)
-    Process.put(:iex_history_counter, counter+1)
+  def each(%History{} = state, fun) do
+    state
+    |> to_list()
+    |> Enum.each(fun)
+  end
 
-    limit = IEx.Options.get(:history_size)
-    start_counter = Process.get(:iex_history_start_counter)
-    should_collect = limit_history(start_counter, counter, limit, false)
-    if should_collect do
-      collect_garbage()
+  @doc """
+  Gets the nth item from the history.
+
+  If `n` < 0, the count starts from the most recent item and goes back in time.
+  """
+  # Traverses the queue front-to-back if the index is positive.
+  def nth(%History{queue: q, size: size, start: start}, n)
+      when n - start >= 0 and n - start < size do
+    get_nth(q, n - start)
+  end
+
+  # Traverses the queue back-to-front if the index is negative.
+  def nth(%History{queue: q, size: size, start: start}, n)
+      when n < 0 and size + n >= start - 1 do
+    get_nth(:queue.reverse(q), abs(n) - 1)
+  end
+
+  def nth(%History{}, n) do
+    raise "v(#{n}) is out of bounds"
+  end
+
+  defp get_nth(q, 0), do: :queue.head(q)
+  defp get_nth(q, n) when n > 0, do: get_nth(:queue.tail(q), n - 1)
+
+  defp append(%{queue: q, size: size} = state, item) do
+    %{state | queue: :queue.in(item, q), size: size + 1}
+  end
+
+  defp to_list(%{queue: q}), do: :queue.to_list(q)
+
+  # Based on https://github.com/erlang/otp/blob/7dcccee4371477e983f026db9e243cb66900b1ef/lib/stdlib/src/shell.erl#L1401
+  defp collect_garbage() do
+    collect_proc_garbage(Process.whereis(:user))
+    collect_proc_garbage(Process.group_leader())
+    :erlang.garbage_collect()
+  end
+
+  defp collect_proc_garbage(process) do
+    try do
+      :erlang.garbage_collect(process)
+    catch
+      _, _ -> nil
     end
   end
 
-  defp limit_history(_, _, limit, _) when limit < 0 do
-    false
+  defp prune(%{start: start} = state, limit) do
+    prune(state, start, limit, false)
   end
 
-  defp limit_history(counter, max_counter, limit, should_collect) when max_counter - counter < limit do
-    Process.put(:iex_history_start_counter, counter)
-    should_collect
+  defp prune(state, _, limit, _) when limit < 0 do
+    {false, state}
   end
 
-  defp limit_history(counter, max_counter, limit, should_collect) do
-    if not should_collect do
-      entry = Process.delete({:iex_history, counter})
-      should_collect = has_binary(entry.result)
-    else
-      Process.delete({:iex_history, counter})
-    end
-    limit_history(counter+1, max_counter, limit, should_collect)
+  defp prune(%{size: size} = state, counter, limit, collect?) when size - counter < limit do
+    {collect?, %{state | start: counter}}
+  end
+
+  defp prune(%{queue: q} = state, counter, limit, collect?) do
+    {{:value, entry}, q} = :queue.out(q)
+    collect? = collect? || has_binary(entry)
+    prune(%{state | queue: q}, counter + 1, limit, collect?)
   end
 
   # Checks val and each of its elements (if it is a list or a tuple)
-  # recursively to see if it has any binaries
+  # recursively to see if it has any large binaries (outside of the heap).
   defp has_binary(val) do
     try do
       has_bin(val)
     catch
-      :throw, true -> true
+      :throw, :found -> true
     end
   end
 
-  # Worker function used by has_binary. Throws when the first binary of the
-  # minimum specified size is found
-  defp has_bin(val) when is_tuple(val) do
-    has_bin(val, tuple_size(val)-1)
+  defp has_bin(val) when is_tuple(val), do: has_bin(val, tuple_size(val) - 1)
+
+  defp has_bin([head | tail]) do
+    has_bin(head)
+    has_bin(tail)
   end
 
-  defp has_bin([h|t]) do
-    has_bin(h)
-    has_bin(t)
-  end
+  defp has_bin(val) when byte_size(val) > 64, do: throw(:found)
 
-  defp has_bin(val) when byte_size(val) > 64 do
-    throw true
-  end
+  defp has_bin(_), do: false
 
-  defp has_bin(_) do
-    false
-  end
-
-  defp has_bin(_, -1) do
-    false
-  end
+  defp has_bin(_, -1), do: false
 
   defp has_bin(tuple, index) do
     has_bin(elem(tuple, index))
-    has_bin(tuple, index-1)
-  end
-
-  # Based on https://github.com/erlang/otp/blob/7dcccee4371477e983f026db9e243cb66900b1ef/lib/stdlib/src/shell.erl#L1401
-  defp collect_garbage do
-    :erlang.garbage_collect(self())
-    try do
-      :erlang.garbage_collect(Process.whereis(:user))
-    catch
-      _, _ -> nil
-    end
-    try do
-      :erlang.garbage_collect(Process.group_leader())
-    catch
-      _, _ -> nil
-    end
-    :erlang.garbage_collect()
-  end
-
-  @doc """
-  Enumerates each item in the history.
-  """
-  def each(fun) do
-    each(Process.get(:iex_history_start_counter),
-         Process.get(:iex_history_counter),
-         fun)
-  end
-
-  defp each(counter, max_counter, fun) when counter < max_counter do
-    entry = Process.get({:iex_history, counter})
-    fun.(entry)
-    each(counter+1, max_counter, fun)
-  end
-
-  defp each(_, _, _) do
-    :ok
-  end
-
-  @doc """
-  Gets the nth item in the history.
-  """
-  def nth(n) do
-    entry = case n do
-      n when n >= 0 ->
-        Process.get({:iex_history, n})
-      n when n < 0 ->
-        counter = Process.get(:iex_history_counter)
-        Process.get({:iex_history, counter + n})
-    end
-    if nil?(entry) do
-      raise "v(#{n}) is out of bounds"
-    end
-    entry
+    has_bin(tuple, index - 1)
   end
 end

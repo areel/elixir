@@ -1,256 +1,197 @@
-% A bunch of helpers to help to deal with errors in Elixir source code.
-% This is not exposed in the Elixir language.
+%% A bunch of helpers to help to deal with errors in Elixir source code.
+%% This is not exposed in the Elixir language.
+%%
+%% Note that this is also called by the Erlang backend, so we also support
+%% the line number to be none (as it may happen in some erlang errors).
 -module(elixir_errors).
--export([syntax_error/3, syntax_error/4,
-  compile_error/3, compile_error/4, inspect/1,
-  form_error/4, parse_error/4, assert_module_scope/3,
-  assert_no_function_scope/3, assert_function_scope/3,
-  assert_no_match_scope/3, assert_no_guard_scope/3,
-  assert_no_match_or_guard_scope/3, warn/1,
-  handle_file_warning/2, handle_file_warning/3, handle_file_error/2,
-  deprecation/3, deprecation/4]).
+-export([compile_error/3, compile_error/4, warning_prefix/0,
+         form_error/4, form_warn/4, parse_error/4, erl_warn/3, io_warn/4]).
 -include("elixir.hrl").
 
-warn(Warning) ->
-  elixir_code_server:cast(register_warning),
-  io:put_chars(standard_error, Warning).
+%% Low-level warning, should be used only from Erlang passes.
+-spec erl_warn(non_neg_integer() | none, unicode:chardata(), unicode:chardata()) -> ok.
+erl_warn(none, File, Warning) ->
+  erl_warn(0, File, Warning);
+erl_warn(Line, File, Warning) when is_integer(Line), is_binary(File) ->
+  io_warn(Line, File, Warning, [Warning, "\n  ", file_format(Line, File), $\n]).
 
-%% Handle inspecting for exceptions modules
+%% Low-level warning, all other warnings are built on top of it.
+-spec io_warn(non_neg_integer(), unicode:chardata() | nil, unicode:chardata(), unicode:chardata()) -> ok.
+io_warn(Line, File, LogMessage, PrintMessage) when is_integer(Line), is_binary(File) or (File == nil) ->
+  send_warning(Line, File, LogMessage),
+  print_warning(PrintMessage).
 
-inspect(Atom) when is_atom(Atom) ->
-  'Elixir.Inspect.Atom':inspect(Atom).
+-spec warning_prefix() -> binary().
+warning_prefix() ->
+  case application:get_env(elixir, ansi_enabled) of
+    {ok, true} -> <<"\e[33mwarning: \e[0m">>;
+    _ -> <<"warning: ">>
+  end.
 
-%% Raised during macros translation.
+%% General forms handling.
 
--spec syntax_error(non_neg_integer() | list(), file:filename(), binary() | string()) -> no_return().
--spec syntax_error(non_neg_integer() | list(), file:filename(), binary() | string(), list()) -> no_return().
-
-syntax_error(Meta, File, Message) when is_list(Message) ->
-  syntax_error(Meta, File, iolist_to_binary(Message));
-
-syntax_error(Meta, File, Message) when is_binary(Message) ->
-  raise(Meta, File, 'Elixir.SyntaxError', Message).
-
-syntax_error(Meta, File, Format, Args)  ->
-  Message = io_lib:format(Format, Args),
-  raise(Meta, File, 'Elixir.SyntaxError', elixir_utils:characters_to_binary(Message)).
-
-compile_error(Meta, File, Message) when is_list(Message) ->
-  compile_error(Meta, File, iolist_to_binary(Message));
-
-compile_error(Meta, File, Message) when is_binary(Message) ->
-  raise(Meta, File, 'Elixir.CompileError', Message).
-
-compile_error(Meta, File, Format, Args)  ->
-  Message = io_lib:format(Format, Args),
-  raise(Meta, File, 'Elixir.CompileError', elixir_utils:characters_to_binary(Message)).
-
-%% Raised on tokenizing/parsing
-
--spec parse_error(non_neg_integer() | list(), file:filename(), iolist() | atom(), [] | iolist()) -> no_return().
-
-parse_error(Meta, File, Error, []) ->
-  Message = case Error of
-    "syntax error before: " -> <<"syntax error: expression is incomplete">>;
-    _ -> iolist_to_binary(Error)
-  end,
-  raise(Meta, File, 'Elixir.TokenMissingError', Message);
-
-parse_error(Meta, File, "syntax error before: ", "'end'") ->
-  raise(Meta, File, 'Elixir.SyntaxError', <<"unexpected token: end">>);
-
-parse_error(Meta, File, Error, Token) ->
-  BinError = if
-    is_atom(Error) -> atom_to_binary(Error, utf8);
-    true -> iolist_to_binary(Error)
-  end,
-
-  BinToken = if
-    Token == [] -> <<>>;
-    true        -> elixir_utils:characters_to_binary(Token)
-  end,
-
-  Message = <<BinError / binary, BinToken / binary >>,
-  raise(Meta, File, 'Elixir.SyntaxError', Message).
-
-%% Raised during compilation
-
--spec form_error(non_neg_integer() | list(), file:filename(), module(), any()) -> no_return().
-
+-spec form_error(list(), binary() | #{file := binary(), _ => _}, module(), any()) -> no_return().
+form_error(Meta, #{file := File}, Module, Desc) ->
+  compile_error(Meta, File, Module:format_error(Desc));
 form_error(Meta, File, Module, Desc) ->
-  Message = iolist_to_binary(format_error(Module, Desc)),
-  raise(Meta, File, 'Elixir.CompileError', Message).
+  compile_error(Meta, File, Module:format_error(Desc)).
 
-%% Shows a deprecation message
+-spec form_warn(list(), binary() | #{file := binary(), _ => _}, module(), any()) -> ok.
+form_warn(Meta, File, Module, Desc) when is_list(Meta), is_binary(File) ->
+  form_warn(Meta, #{file => File}, Module, Desc);
+form_warn(Meta, #{file := File} = E, Module, Desc) when is_list(Meta) ->
+  % Skip warnings during bootstrap, they will be reported during recompilation
+  case elixir_config:get(bootstrap) of
+    true -> ok;
+    false -> do_form_warn(Meta, File, E, Module:format_error(Desc))
+  end.
 
-deprecation(Meta, File, Message) -> deprecation(Meta, File, Message, []).
+do_form_warn(Meta, GivenFile, E, Warning) ->
+  [{file, File}, {line, Line}] = meta_location(Meta, GivenFile),
 
-deprecation(Meta, File, Message, Args) ->
-  io:format(file_format(?line(Meta), File, io_lib:format(Message, Args))).
-
-%% Handle warnings and errors (called during module compilation)
-
-%% Ignore on bootstrap
-handle_file_warning(true, _File, { _Line, sys_core_fold, nomatch_guard }) -> [];
-handle_file_warning(true, _File, { _Line, sys_core_fold, { nomatch_shadow, _ } }) -> [];
-
-%% Ignore always
-handle_file_warning(_, _File, { _Line, sys_core_fold, useless_building }) -> [];
-
-%% This is an Erlang bug, it considers { tuple, _ }.call to always fail
-handle_file_warning(_, _File, { _Line, v3_kernel, bad_call }) -> [];
-
-%% We handle unused local warnings ourselves
-handle_file_warning(_, _File, { _Line, erl_lint, { unused_function, _ } }) -> [];
-
-%% Make no_effect clauses pretty
-handle_file_warning(_, File, { Line, sys_core_fold, { no_effect, { erlang, F, A } } }) ->
-  { Fmt, Args } = case erl_internal:comp_op(F, A) of
-    true -> { "use of operator ~ts has no effect", [translate_comp_op(F)] };
-    false ->
-      case erl_internal:bif(F, A) of
-        false -> { "the call to :erlang.~ts/~B has no effect", [F,A] };
-        true -> { "the call to ~ts/~B has no effect", [F,A] }
-      end
-  end,
-  Message = io_lib:format(Fmt, Args),
-  warn(file_format(Line, File, Message));
-
-%% Rewrite undefined behaviour to check for protocols
-handle_file_warning(_, File, {Line,erl_lint,{undefined_behaviour_func,{Fun,Arity},Module}}) ->
-  { DefKind, Def, DefArity } =
-    case atom_to_list(Fun) of
-      "MACRO-" ++ Rest -> { macro, list_to_atom(Rest), Arity - 1 };
-      _ -> { function, Fun, Arity }
+  Location =
+    case E of
+      #{function := {Name, Arity}, module := Module} ->
+        [file_format(Line, File), ": ", 'Elixir.Exception':format_mfa(Module, Name, Arity)];
+      #{module := Module} when Module /= nil ->
+        [file_format(Line, File), ": ", elixir_aliases:inspect(Module)];
+      #{} ->
+        file_format(Line, File)
     end,
 
-  Kind    = protocol_or_behaviour(Module),
-  Raw     = "undefined ~ts ~ts ~ts/~B (for ~ts ~ts)",
-  Message = io_lib:format(Raw, [Kind, DefKind, Def, DefArity, Kind, inspect(Module)]),
-  warn(file_format(Line, File, Message));
+  io_warn(Line, File, Warning, [Warning, "\n  ", Location, $\n]).
 
-handle_file_warning(_, File, {Line,erl_lint,{undefined_behaviour,Module}}) ->
-  case elixir_compiler:get_opt(internal) of
-    true  -> [];
-    false ->
-      Message = io_lib:format("behaviour ~ts undefined", [inspect(Module)]),
-      warn(file_format(Line, File, Message))
-  end;
+%% Compilation error.
 
-%% Ignore unused vars at "weird" lines (<= 0)
-handle_file_warning(_, _File, {Line,erl_lint,{unused_var,_Var}}) when Line =< 0 ->
-  [];
+-spec compile_error(list(), binary(), binary() | unicode:charlist()) -> no_return().
+-spec compile_error(list(), binary(), string(), list()) -> no_return().
 
-%% Ignore shadowed vars as we guarantee no conflicts ourselves
-handle_file_warning(_, _File, {_Line,erl_lint,{shadowed_var,_Var,_Where}}) ->
-  [];
+compile_error(Meta, File, Message) when is_binary(Message) ->
+  MetaLocation = meta_location(Meta, File),
+  raise('Elixir.CompileError', Message, MetaLocation);
+compile_error(Meta, File, Message) when is_list(Message) ->
+  MetaLocation = meta_location(Meta, File),
+  raise('Elixir.CompileError', elixir_utils:characters_to_binary(Message), MetaLocation).
 
-%% Properly format other unused vars
-handle_file_warning(_, File, {Line,erl_lint,{unused_var,Var}}) ->
-  Message = format_error(erl_lint, { unused_var, format_var(Var) }),
-  warn(file_format(Line, File, Message));
+compile_error(Meta, File, Format, Args) when is_list(Format)  ->
+  compile_error(Meta, File, io_lib:format(Format, Args)).
 
-%% Default behavior
-handle_file_warning(_, File, {Line,Module,Desc}) ->
-  Message = format_error(Module, Desc),
-  warn(file_format(Line, File, Message)).
+%% Tokenization parsing/errors.
 
-handle_file_warning(File, Desc) ->
-  handle_file_warning(false, File, Desc).
-
--spec handle_file_error(file:filename(), {non_neg_integer(), module(), any()}) -> no_return().
-
-handle_file_error(File, {Line,erl_lint,{unsafe_var,Var,{In,_Where}}}) ->
-  Translated = case In of
-    'orelse'  -> 'or';
-    'andalso' -> 'and';
-    _ -> In
+-spec parse_error(elixir:keyword(), binary() | {binary(), binary()},
+                  binary(), binary()) -> no_return().
+parse_error(Location, File, Error, <<>>) ->
+  Message = case Error of
+    <<"syntax error before: ">> -> <<"syntax error: expression is incomplete">>;
+    _ -> Error
   end,
-  Message = io_lib:format("cannot define variable ~ts inside ~ts", [format_var(Var), Translated]),
-  raise(Line, File, 'Elixir.CompileError', iolist_to_binary(Message));
+  raise(Location, File, 'Elixir.TokenMissingError', Message);
 
-handle_file_error(File, {Line,Module,Desc}) ->
-  form_error(Line, File, Module, Desc).
+%% Show a nicer message for end of line
+parse_error(Location, File, <<"syntax error before: ">>, <<"eol">>) ->
+  raise(Location, File, 'Elixir.SyntaxError',
+        <<"unexpectedly reached end of line. The current expression is invalid or incomplete">>);
 
-%% Assertions
 
-assert_no_function_scope(_Meta, _Kind, #elixir_scope{function=nil}) -> [];
-assert_no_function_scope(Meta, Kind, S) ->
-  syntax_error(Meta, S#elixir_scope.file, "cannot invoke ~ts inside a function", [Kind]).
+%% Show a nicer message for keywords pt1 (Erlang keywords show up wrapped in single quotes)
+parse_error(Location, File, <<"syntax error before: ">>, Keyword)
+    when Keyword == <<"'not'">>;
+         Keyword == <<"'and'">>;
+         Keyword == <<"'or'">>;
+         Keyword == <<"'when'">>;
+         Keyword == <<"'after'">>;
+         Keyword == <<"'catch'">>;
+         Keyword == <<"'end'">> ->
+  raise_reserved(Location, File, binary_part(Keyword, 1, byte_size(Keyword) - 2));
 
-assert_module_scope(Meta, Kind, #elixir_scope{module=nil,file=File}) ->
-  syntax_error(Meta, File, "cannot invoke ~ts outside module", [Kind]);
-assert_module_scope(_Meta, _Kind, #elixir_scope{module=Module}) -> Module.
+%% Show a nicer message for keywords pt2 (Elixir keywords show up as is)
+parse_error(Location, File, <<"syntax error before: ">>, Keyword)
+    when Keyword == <<"fn">>;
+         Keyword == <<"else">>;
+         Keyword == <<"rescue">>;
+         Keyword == <<"true">>;
+         Keyword == <<"false">>;
+         Keyword == <<"nil">>;
+         Keyword == <<"in">> ->
+  raise_reserved(Location, File, Keyword);
 
-assert_function_scope(Meta, Kind, #elixir_scope{function=nil,file=File}) ->
-  syntax_error(Meta, File, "cannot invoke ~ts outside function", [Kind]);
-assert_function_scope(_Meta, _Kind, #elixir_scope{function=Function}) -> Function.
+%% Produce a human-readable message for errors before a sigil
+parse_error(Location, File, <<"syntax error before: ">>, <<"{sigil,", _Rest/binary>> = Full) ->
+  {sigil, _, Sigil, [Content | _], _, _, _} = parse_erl_term(Full),
+  Content2 = case is_binary(Content) of
+    true -> Content;
+    false -> <<>>
+  end,
+  Message = <<"syntax error before: sigil \~", Sigil, " starting with content '", Content2/binary, "'">>,
+  raise(Location, File, 'Elixir.SyntaxError', Message);
 
-assert_no_match_or_guard_scope(Meta, Kind, S) ->
-  assert_no_match_scope(Meta, Kind, S),
-  assert_no_guard_scope(Meta, Kind, S).
+%% Binaries (and interpolation) are wrapped in [<<...>>]
+parse_error(Location, File, Error, <<"[", _/binary>> = Full) when is_binary(Error) ->
+  Term = case parse_erl_term(Full) of
+    [H | _] when is_binary(H) -> <<$", H/binary, $">>;
+    _ -> <<$">>
+  end,
+  raise(Location, File, 'Elixir.SyntaxError', <<Error/binary, Term/binary>>);
 
-assert_no_match_scope(Meta, _Kind, #elixir_scope{context=match} = S) ->
-  compile_error(Meta, S#elixir_scope.file, "invalid pattern in match clause", []);
-assert_no_match_scope(_Meta, _Kind, _S) -> [].
+%% Given a string prefix and suffix to insert the token inside the error message rather than append it
+parse_error(Location, File, {ErrorPrefix, ErrorSuffix}, Token) when is_binary(ErrorPrefix), is_binary(ErrorSuffix), is_binary(Token) ->
+  Message = <<ErrorPrefix/binary, Token/binary, ErrorSuffix/binary >>,
+  raise(Location, File, 'Elixir.SyntaxError', Message);
 
-assert_no_guard_scope(Meta, _Kind, #elixir_scope{context=guard} = S) ->
-  compile_error(Meta, S#elixir_scope.file, "invalid pattern in guard", []);
-assert_no_guard_scope(_Meta, _Kind, _S) -> [].
+%% Misplaced char tokens (for example, {char, _, 97}) are translated by Erlang into
+%% the char literal (i.e., the token in the previous example becomes $a),
+%% because {char, _, _} is a valid Erlang token for an Erlang char literal. We
+%% want to represent that token as ?a in the error, according to the Elixir
+%% syntax.
+parse_error(Location, File, <<"syntax error before: ">>, <<$$, Char/binary>>) ->
+  Message = <<"syntax error before: ?", Char/binary>>,
+  raise(Location, File, 'Elixir.SyntaxError', Message);
+
+%% Everything else is fine as is
+parse_error(Location, File, Error, Token) when is_binary(Error), is_binary(Token) ->
+  Message = <<Error/binary, Token/binary >>,
+  raise(Location, File, 'Elixir.SyntaxError', Message).
+
+parse_erl_term(Term) ->
+  {ok, Tokens, _} = erl_scan:string(binary_to_list(Term)),
+  {ok, Parsed} = erl_parse:parse_term(Tokens ++ [{dot, 1}]),
+  Parsed.
+
+raise_reserved(Location, File, Keyword) ->
+  raise(Location, File, 'Elixir.SyntaxError',
+        <<"syntax error before: ", Keyword/binary, ". \"", Keyword/binary, "\" is a "
+          "reserved word in Elixir and therefore its usage is limited. For instance, "
+          "it can't be used as a variable or be defined nor invoked as a regular function">>).
 
 %% Helpers
 
-raise(Meta, File, Kind, Message) when is_list(Meta) ->
-  raise(?line(Meta), File, Kind, Message);
+print_warning(Message) ->
+  io:put_chars(standard_error, [warning_prefix(), Message, $\n]),
+  ok.
 
-raise(none, File, Kind, Message) ->
-  raise(0, File, Kind, Message);
-
-raise(Line, File, Kind, Message) when is_integer(Line) ->
-  %% Populate the stacktrace so we can raise it
-  try
-    throw(ok)
-  catch
-    ok -> ok
+send_warning(Line, File, Message) ->
+  case get(elixir_compiler_pid) of
+    undefined -> ok;
+    CompilerPid -> CompilerPid ! {warning, File, Line, Message}
   end,
-  Stacktrace = erlang:get_stacktrace(),
-  Exception = Kind:new([{description, Message}, {file, iolist_to_binary(File)}, {line, Line}]),
+  ok.
+
+file_format(0, File) ->
+  io_lib:format("~ts", [elixir_utils:relative_to_cwd(File)]);
+
+file_format(Line, File) ->
+  io_lib:format("~ts:~w", [elixir_utils:relative_to_cwd(File), Line]).
+
+meta_location(Meta, File) ->
+  case elixir_utils:meta_keep(Meta) of
+    {F, L} -> [{file, F}, {line, L}];
+    nil    -> [{file, File}, {line, ?line(Meta)}]
+  end.
+
+raise(Location, File, Kind, Message) when is_binary(File) ->
+  raise(Kind, Message, [{file, File} | Location]).
+
+raise(Kind, Message, Opts) when is_binary(Message) ->
+  Stacktrace = try throw(ok) catch _:_:Stack -> Stack end,
+  Exception = Kind:exception([{description, Message} | Opts]),
   erlang:raise(error, Exception, tl(Stacktrace)).
-
-file_format(0, File, Message) ->
-  io_lib:format("~ts: ~ts~n", [elixir_utils:relative_to_cwd(File), Message]);
-
-file_format(Line, File, Message) ->
-  io_lib:format("~ts:~w: ~ts~n", [elixir_utils:relative_to_cwd(File), Line, Message]).
-
-format_var(Var) ->
-  list_to_atom(lists:takewhile(fun(X) -> X /= $@ end, atom_to_list(Var))).
-
-format_error([], Desc) ->
-  io_lib:format("~p", [Desc]);
-
-format_error(Module, Desc) ->
-  Module:format_error(Desc).
-
-protocol_or_behaviour(Module) ->
-  case is_protocol(Module) of
-    true  -> protocol;
-    false -> behaviour
-  end.
-
-is_protocol(Module) ->
-  case code:ensure_loaded(Module) of
-    { module, _ } ->
-      case erlang:function_exported(Module, '__protocol__', 1) of
-        true  -> Module:'__protocol__'(name) == Module;
-        false -> false
-      end;
-    { error, _ } ->
-      false
-  end.
-
-translate_comp_op('/=') -> '!=';
-translate_comp_op('=<') -> '<=';
-translate_comp_op('=:=') -> '===';
-translate_comp_op('=/=') -> '!==';
-translate_comp_op(Other) -> Other.

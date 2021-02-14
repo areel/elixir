@@ -1,382 +1,478 @@
-% Holds the logic responsible for functions definition (def(p) and defmacro(p)).
+% Holds the logic responsible for function definitions (def(p) and defmacro(p)).
 -module(elixir_def).
--export([table/1,
-  clauses_table/1,
-  setup/1,
-  cleanup/1,
-  reset_last/1,
-  lookup_definition/2,
-  delete_definition/2,
-  wrap_definition/6,
-  store_definition/7,
-  store_each/8,
-  unwrap_stored_definitions/2,
-  format_error/1]).
+-export([setup/1, reset_last/1, local_for/4,
+  take_definition/2, store_definition/5, store_definition/9,
+  fetch_definitions/2, format_error/1]).
 -include("elixir.hrl").
+-define(last_def, {elixir, last_def}).
 
--define(attr, '__def_table').
--define(clauses_attr, '__clauses_table').
-
-%% Table management functions. Called internally.
-
-table(Module) ->
-  ets:lookup_element(Module, ?attr, 2).
-
-clauses_table(Module) ->
-  ets:lookup_element(Module, ?clauses_attr, 2).
-
-setup(Module) ->
-  ets:insert(Module, { ?attr, ets:new(Module, [set, public]) }),
-  ets:insert(Module, { ?clauses_attr, ets:new(Module, [bag, public]) }),
-  reset_last(Module),
+setup(DataTables) ->
+  reset_last(DataTables),
   ok.
 
-cleanup(Module) ->
-  ets:delete(table(Module)),
-  ets:delete(clauses_table(Module)).
+reset_last({DataSet, _DataBag}) ->
+  ets:insert(DataSet, {?last_def, none});
 
-%% Reset the last item. Useful when evaling code.
-reset_last(Module) ->
-  ets:insert(table(Module), { last, [] }).
+reset_last(Module) when is_atom(Module) ->
+  reset_last(elixir_module:data_tables(Module)).
 
-%% Looks up a definition from the database.
-lookup_definition(Module, Tuple) ->
-  case ets:lookup(table(Module), Tuple) of
-    [Result] ->
-      CTable = clauses_table(Module),
-      { Result, [Clause || { _, Clause } <- ets:lookup(CTable, Tuple)] };
-    _ ->
+local_for(Module, Name, Arity, Kinds) ->
+  Tuple = {Name, Arity},
+
+  try
+    {Set, Bag} = elixir_module:data_tables(Module),
+    {ets:lookup(Set, {def, Tuple}), ets:lookup(Bag, {clauses, Tuple})}
+  of
+    {[{_, Kind, Meta, _, _, _}], Clauses} ->
+      case (Kinds == all) orelse (lists:member(Kind, Kinds)) of
+        true -> elixir_erl:definition_to_anonymous(Module, Kind, Meta,
+                                                   [Clause || {_, Clause} <- Clauses]);
+        false -> false
+      end;
+    {[], _} ->
+      false
+  catch
+    _:_ -> false
+  end.
+
+%% Take a definition out of the table
+
+take_definition(Module, {Name, Arity} = Tuple) ->
+  {Set, Bag} = elixir_module:data_tables(Module),
+  case ets:take(Set, {def, Tuple}) of
+    [{{def, Tuple}, _, _, _, _, {Defaults, _, _}} = Result] ->
+      ets:delete_object(Bag, {defs, Tuple}),
+      ets:delete_object(Bag, {{default, Name}, Arity, Defaults}),
+      {Result, [Clause || {_, Clause} <- ets:take(Bag, {clauses, Tuple})]};
+    [] ->
       false
   end.
 
-delete_definition(Module, Tuple) ->
-  ets:delete(table(Module), Tuple),
-  ets:delete(clauses_table(Module), Tuple).
+%% Fetch all available definitions
 
-%% Wraps the function into a call to store_definition once the function
-%% definition is read. The function is compiled into a meta tree to ensure
-%% we will receive the full function.
-%%
-%% We need to wrap functions instead of eagerly defining them to ensure
-%% functions inside branches won't propagate, for example:
-%%
-%%   if false do
-%%     def bar, do: 1
-%%   else
-%%     def bar, do: 2
-%%   end
-%%
-%% If we just analyzed the compiled structure (i.e. the function availables
-%% before evaluating the function body), we would see both definitions.
+fetch_definitions(File, Module) ->
+  {Set, Bag} = elixir_module:data_tables(Module),
 
-wrap_definition(Kind, Meta, Call, Expr, CheckClauses, S) ->
-  Line = ?line(Meta),
-  ?wrap_call(Line, ?MODULE, store_definition, [
-    {atom, Line, Kind},
-    {integer, Line, Line},
-    {atom, Line, CheckClauses},
-    {var, Line, '_@MODULE'},
-    Call,
-    Expr,
-    elixir_scope:serialize(S)
-  ]).
-
-% Invoked by the wrap definition with the function abstract tree.
-% Each function is then added to the function table.
-
-store_definition(Kind, Line, CheckClauses, Module, Call, Body, RawS) ->
-  S = elixir_scope:deserialize(RawS),
-  { NameAndArgs, Guards } = elixir_clauses:extract_guards(Call),
-
-  { Name, Args } = case elixir_clauses:extract_args(NameAndArgs) of
-    error ->
-      Format = [Kind, 'Elixir.Macro':to_string(NameAndArgs)],
-      elixir_errors:syntax_error(Line, S#elixir_scope.file, "invalid syntax in ~ts ~ts", Format);
-    Tuple ->
-      Tuple
+  Entries = try
+    lists:sort(ets:lookup_element(Bag, defs, 2))
+  catch
+    error:badarg -> []
   end,
 
-  assert_no_aliases_name(Line, Name, Args, S),
-  store_definition(Kind, Line, CheckClauses, Module, Name, Args, Guards, Body, S).
+  fetch_definition(Entries, File, Module, Set, Bag, [], []).
 
-store_definition(Kind, Line, _CheckClauses, nil, _Name, _Args, _Guards, _Body, #elixir_scope{file=File}) ->
-  elixir_errors:form_error(Line, File, ?MODULE, { no_module, Kind });
+fetch_definition([Tuple | T], File, Module, Set, Bag, All, Private) ->
+  [{_, Kind, Meta, _, Check, {MaxDefaults, _, Defaults}}] = ets:lookup(Set, {def, Tuple}),
 
-store_definition(Kind, Line, CheckClauses, Module, Name, Args, Guards, Body, #elixir_scope{} = DS) ->
-  Arity = length(Args),
-  Tuple = { Name, Arity },
-  S = DS#elixir_scope{module=Module, function=Tuple},
-  elixir_tracker:record_definition(Tuple, Kind, Module),
+  try ets:lookup_element(Bag, {clauses, Tuple}, 2) of
+    Clauses ->
+      NewAll =
+        [{Tuple, Kind, add_defaults_to_meta(MaxDefaults, Meta), Clauses} | All],
+      NewPrivate =
+        case (Kind == defp) orelse (Kind == defmacrop) of
+          true ->
+            Metas = head_and_definition_meta(Check, Meta, MaxDefaults - Defaults, All),
+            [{Tuple, Kind, Metas, MaxDefaults} | Private];
+          false ->
+            Private
+        end,
+      fetch_definition(T, File, Module, Set, Bag, NewAll, NewPrivate)
+  catch
+    error:badarg ->
+      check_bodiless_function(Check, Meta, File, Module, Kind, Tuple),
+      fetch_definition(T, File, Module, Set, Bag, All, Private)
+  end;
 
-  CO = elixir_compiler:get_opts(),
-  Location = retrieve_file(Line, Module, S, CO),
-  run_on_definition_callbacks(Kind, Line, Module, Name, Args, Guards, Body, S, CO),
+fetch_definition([], _File, _Module, _Set, _Bag, All, Private) ->
+  {All, Private}.
 
-  { Function, Defaults, TS } = translate_definition(Kind, Line, Name, Args, Guards, Body, S),
+add_defaults_to_meta(0, Meta) -> Meta;
+add_defaults_to_meta(Defaults, Meta) -> [{defaults, Defaults} | Meta].
 
-  DefaultsLength = length(Defaults),
-  elixir_tracker:record_defaults(Tuple, Kind, Module, DefaultsLength),
+head_and_definition_meta(true, Meta, 0, _All) ->
+  Meta;
+head_and_definition_meta(true, _Meta, _HeadDefaults, [{_, _, HeadMeta, _} | _]) ->
+  HeadMeta;
+head_and_definition_meta(false, _Meta, _HeadDefaults, _All) ->
+  false.
 
-  File  = TS#elixir_scope.file,
-  Table = table(Module),
-  CTable = clauses_table(Module),
+%% Section for storing definitions
 
-  compile_super(Module, TS),
-  check_previous_defaults(Table, Line, Name, Arity, Kind, DefaultsLength, S),
+store_definition(Kind, CheckClauses, Call, Body, Pos) ->
+  #{line := Line} = E = elixir_locals:get_cached_env(Pos),
+  {NameAndArgs, Guards} = elixir_utils:extract_guards(Call),
 
-  store_each(CheckClauses, Kind, File, Location,
-    Table, CTable, DefaultsLength, Function),
-  [store_each(false, Kind, File, Location, Table, CTable, 0,
-    default_function_for(Kind, Name, Default)) || Default <- Defaults],
-
-  { Name, Arity }.
-
-%% @on_definition
-
-run_on_definition_callbacks(Kind, Line, Module, Name, Args, Guards, Expr, S, CO) ->
-  case elixir_compiler:get_opt(internal, CO) of
-    true ->
-      ok;
-    _ ->
-      Env = elixir_scope:to_ex_env({ Line, S }),
-      Callbacks = 'Elixir.Module':get_attribute(Module, on_definition),
-      [Mod:Fun(Env, Kind, Name, Args, Guards, Expr) || { Mod, Fun } <- Callbacks]
-  end.
-
-%% Retrieve @file or fallback to default
-
-retrieve_file(Line, Module, S, CO) ->
-  case elixir_compiler:get_opt(internal, CO) of
-    true -> { elixir_utils:characters_to_list(S#elixir_scope.file), Line };
-    _ ->
-      case 'Elixir.Module':get_attribute(Module, file) of
-        nil  -> { elixir_utils:characters_to_list(S#elixir_scope.file), Line };
-        Else ->
-          'Elixir.Module':delete_attribute(Module, file),
-          { Else, 0 }
-      end
-  end.
-
-%% Compile super
-
-compile_super(Module, #elixir_scope{function=Function, super=true}) ->
-  elixir_def_overridable:store(Module, Function, true);
-
-compile_super(_Module, _S) -> ok.
-
-%% Translate the given call and expression given
-%% and then store it in memory.
-
-translate_definition(Kind, Line, Name, RawArgs, RawGuards, RawBody, S) when is_integer(Line) ->
-  Args    = elixir_quote:linify(Line, RawArgs),
-  Guards  = elixir_quote:linify(Line, RawGuards),
-  Body    = elixir_quote:linify(Line, RawBody),
-  Arity   = length(Args),
-
-  %% Macros receive a special argument on invocation. Notice it does
-  %% not affect the arity of the stored function, but the clause
-  %% already contains it.
-  ExtendedArgs = case is_macro(Kind) of
-    true  -> [{ '_@CALLER', [{line,Line}], nil }|Args];
-    false -> Args
+  {Name, Args} = case NameAndArgs of
+    {N, _, A} when is_atom(N), is_atom(A) -> {N, []};
+    {N, _, A} when is_atom(N), is_list(A) -> {N, A};
+    _ -> elixir_errors:form_error([{line, Line}], E, ?MODULE, {invalid_def, Kind, NameAndArgs})
   end,
 
-  { Unpacked, Defaults } = elixir_def_defaults:unpack(Kind, Name, ExtendedArgs, S),
-  { Clauses, TS } = translate_clause(Line, Kind, Unpacked, Guards, Body, S),
+  %% Now that we have verified the call format,
+  %% extract meta information like file and context.
+  {_, Meta, _} = Call,
 
-  Function = { function, Line, Name, Arity, Clauses },
-  { Function, Defaults, TS }.
-
-translate_clause(_Line, _Kind, _Unpacked, [], nil, S) ->
-  { [], S };
-
-translate_clause(Line, Kind, _Unpacked, _Guards, nil, #elixir_scope{file=File}) ->
-  elixir_errors:syntax_error(Line, File, "missing do keyword in ~ts", [Kind]);
-
-translate_clause(Line, Kind, Unpacked, Guards, Body, S) ->
-  Expr = expr_from_body(Line, Body),
-
-  { TClause, TS } = elixir_clauses:assigns_block(Line,
-    fun elixir_translator:translate/2, Unpacked, [Expr], Guards, S),
-
-  %% Set __CALLER__ if used
-  FClause = case is_macro(Kind) andalso TS#elixir_scope.caller of
-    true  ->
-      FBody = { 'match', Line,
-        { 'var', Line, '__CALLER__' },
-        ?wrap_call(Line, elixir_scope, to_ex_env, [{ var, Line, '_@CALLER' }])
-      },
-      setelement(5, TClause, [FBody|element(5, TClause)]);
-    false -> TClause
+  Context = case lists:keyfind(context, 1, Meta) of
+    {context, _} = ContextPair -> [ContextPair];
+    _ -> []
   end,
 
-  { [FClause], TS }.
+  Generated = case lists:keyfind(generated, 1, Meta) of
+    {generated, true} -> ?generated(Context);
+    _ -> Context
+  end,
 
-expr_from_body(_Line, [{ do, Expr }]) -> Expr;
-expr_from_body(Line, Else)            -> { 'try', [{line,Line}], [Else] }.
+  DoCheckClauses = (Context == []) andalso (CheckClauses),
 
-is_macro(defmacro)  -> true;
-is_macro(defmacrop) -> true;
-is_macro(_)         -> false.
-
-% Unwrap the functions stored in the functions table.
-% It returns a list of all functions to be exported, plus the macros,
-% and the body of all functions.
-unwrap_stored_definitions(File, Module) ->
-  Table = table(Module),
-  CTable = clauses_table(Module),
-  ets:delete(Table, last),
-  unwrap_stored_definition(ets:tab2list(Table), CTable, File, [], [], [], [], [], [], []).
-
-unwrap_stored_definition([Fun|T], CTable, File, All, Exports, Private, Def, Defmacro, Functions, Tail) ->
-  Tuple   = element(1, Fun),
-  Clauses = [Clause || { _, Clause } <- ets:lookup(CTable, Tuple)],
-
-  { NewFun, NewExports, NewPrivate, NewDef, NewDefmacro } =
-    case Clauses of
-      [] -> { false, Exports, Private, Def, Defmacro };
-      _  -> unwrap_stored_definition(element(2, Fun), Tuple, Fun, Exports, Private, Def, Defmacro)
+  %% Check if there is a file information in the definition.
+  %% If so, we assume this come from another source and
+  %% we need to linify taking into account keep line numbers.
+  %%
+  %% Line and File will always point to the caller. __ENV__.line
+  %% will always point to the quoted one and __ENV__.file will
+  %% always point to the one at @file or the quoted one.
+  {Location, LinifyArgs, LinifyGuards, LinifyBody} =
+    case elixir_utils:meta_keep(Meta) of
+      {_, _} = MetaFile ->
+        {MetaFile,
+         elixir_quote:linify(Line, keep, Args),
+         elixir_quote:linify(Line, keep, Guards),
+         elixir_quote:linify(Line, keep, Body)};
+      nil ->
+        {nil, Args, Guards, Body}
     end,
 
-  { NewFunctions, NewTail } = case NewFun of
-    false ->
-      NewAll = All,
-      { Functions, Tail };
-    _ ->
-      NewAll = [Tuple|All],
-      function_for_stored_definition(NewFun, Clauses, File, Functions, Tail)
-  end,
+  Arity = length(Args),
 
-  unwrap_stored_definition(T, CTable, File, NewAll, NewExports, NewPrivate,
-    NewDef, NewDefmacro, NewFunctions, NewTail);
+  {File, DefMeta} =
+    case retrieve_location(Location, ?key(E, module)) of
+      {F, L} ->
+        {F, [{line, Line}, {file, {F, L}} | Generated]};
+      nil ->
+        {nil, [{line, Line} | Generated]}
+    end,
 
-unwrap_stored_definition([], _CTable, _File, All, Exports, Private, Def, Defmacro, Functions, Tail) ->
-  { All, Exports, Private, ordsets:from_list(Def),
-    ordsets:from_list(Defmacro), lists:reverse(Tail ++ Functions) }.
+  run_with_location_change(File, E, fun(EL) ->
+    assert_no_aliases_name(DefMeta, Name, Args, EL),
+    assert_valid_name(DefMeta, Kind, Name, Args, EL),
+    store_definition(DefMeta, Kind, DoCheckClauses, Name, Arity,
+                     LinifyArgs, LinifyGuards, LinifyBody, ?key(E, file), EL)
+  end).
 
-unwrap_stored_definition(def, Tuple, Fun, Exports, Private, Def, Defmacro) ->
-  { Fun, [Tuple|Exports], Private, [Tuple|Def], Defmacro };
+store_definition(Meta, Kind, CheckClauses, Name, Arity, DefaultsArgs, Guards, Body, File, ER) ->
+  Module = ?key(ER, module),
+  Tuple = {Name, Arity},
+  E = env_for_expansion(Kind, Tuple, ER),
 
-unwrap_stored_definition(defmacro, { Name, Arity } = Tuple, Fun, Exports, Private, Def, Defmacro) ->
-  Macro = { ?elixir_macro(Name), Arity + 1 },
-  { setelement(1, Fun, Macro), [Macro|Exports], Private, Def, [Tuple|Defmacro] };
+  {Args, Defaults} = unpack_defaults(Kind, Meta, Name, DefaultsArgs, E),
+  Clauses = [elixir_clauses:def(Clause, E) ||
+             Clause <- def_to_clauses(Kind, Meta, Args, Guards, Body, E)],
 
-unwrap_stored_definition(defp, Tuple, Fun, Exports, Private, Def, Defmacro) ->
-  %% { Name, Arity }, Kind, Line, Check, Defaults
-  Info = { Tuple, defp, element(3, Fun), element(5, Fun), element(7, Fun) },
-  { Fun, Exports, [Info|Private], Def, Defmacro };
+  DefaultsLength = length(Defaults),
+  elixir_locals:record_defaults(Tuple, Kind, Module, DefaultsLength, Meta),
+  check_previous_defaults(Meta, Module, Name, Arity, Kind, DefaultsLength, E),
 
-unwrap_stored_definition(defmacrop, Tuple, Fun, Exports, Private, Def, Defmacro) ->
-  %% { Name, Arity }, Kind, Line, Check, Defaults
-  Info  = { Tuple, defmacrop, element(3, Fun), element(5, Fun), element(7, Fun) },
-  { false, Exports, [Info|Private], Def, Defmacro }.
+  store_definition(CheckClauses, Kind, Meta, Name, Arity, File,
+                   Module, DefaultsLength, Clauses),
+  [store_definition(false, Kind, Meta, Name, length(DefaultArgs), File,
+                    Module, 0, [Default]) || {_, DefaultArgs, _, _} = Default <- Defaults],
 
-%% Helpers
+  run_on_definition_callbacks(Kind, Module, Name, DefaultsArgs, Guards, Body, E),
+  Tuple.
 
-function_for_stored_definition({{Name,Arity}, _, Line, _, _, {File, _}, _}, Clauses, File, Functions, Tail) ->
-  { [{ function, Line, Name, Arity, Clauses }|Functions], Tail };
+env_for_expansion(Kind, Tuple, E) when Kind =:= defmacro; Kind =:= defmacrop ->
+  E#{function := Tuple, contextual_vars := ['__CALLER__']};
+env_for_expansion(_Kind, Tuple, E) ->
+  E#{function := Tuple, contextual_vars := []}.
 
-function_for_stored_definition({{Name,Arity}, _, Line, _, _, Location, _}, Clauses, _File, Functions, Tail) ->
-  { Functions, [
-    { function, Line, Name, Arity, Clauses },
-    { attribute, Line, file, Location } | Tail
-  ] }.
-
-default_function_for(Kind, Name, { clause, Line, Args, _Guards, _Exprs } = Clause)
-    when Kind == defmacro; Kind == defmacrop ->
-  { function, Line, Name, length(Args) - 1, [Clause] };
-
-default_function_for(_, Name, { clause, Line, Args, _Guards, _Exprs } = Clause) ->
-  { function, Line, Name, length(Args), [Clause] }.
-
-%% Store each definition in the table.
-%% This function also checks and emit warnings in case
-%% the kind, of the visibility of the function changes.
-
-store_each(Check, Kind, File, Location, Table, CTable, Defaults, {function, Line, Name, Arity, Clauses}) ->
-  Tuple = { Name, Arity },
-  case ets:lookup(Table, Tuple) of
-    [{ Tuple, StoredKind, StoredLine, StoredFile, StoredCheck, StoredLocation, StoredDefaults }] ->
-      FinalLine = StoredLine,
-      FinalLocation = StoredLocation,
-      FinalDefaults = max(Defaults, StoredDefaults),
-      check_valid_kind(Line, File, Name, Arity, Kind, StoredKind),
-      (Check and StoredCheck) andalso
-        check_valid_clause(Line, File, Name, Arity, Kind, Table, StoredLine, StoredFile),
-      check_valid_defaults(Line, File, Name, Arity, Kind, Defaults, StoredDefaults);
+retrieve_location(Location, Module) ->
+  {Set, _} = elixir_module:data_tables(Module),
+  case ets:take(Set, file) of
+    [] when is_tuple(Location) ->
+      {File, Line} = Location,
+      {elixir_utils:relative_to_cwd(File), Line};
     [] ->
-      FinalLine = Line,
-      FinalLocation = Location,
-      FinalDefaults = Defaults
+      nil;
+    [{file, File, _}] when is_binary(File) ->
+      'Elixir.Module':delete_attribute(Module, file),
+      {elixir_utils:relative_to_cwd(File), 0};
+    [{file, {File, Line}, _}] when is_binary(File) andalso is_integer(Line) ->
+      'Elixir.Module':delete_attribute(Module, file),
+      {elixir_utils:relative_to_cwd(File), Line}
+  end.
+
+run_with_location_change(nil, E, Callback) ->
+  Callback(E);
+run_with_location_change(File, #{file := File} = E, Callback) ->
+  Callback(E);
+run_with_location_change(File, E, Callback) ->
+  elixir_lexical:with_file(File, E, Callback).
+
+def_to_clauses(_Kind, Meta, Args, [], nil, E) ->
+  check_args_for_function_head(Meta, Args, E),
+  [];
+def_to_clauses(_Kind, Meta, Args, Guards, [{do, Body}], _E) ->
+  [{Meta, Args, Guards, Body}];
+def_to_clauses(Kind, Meta, Args, Guards, Body, E) ->
+  case is_list(Body) andalso lists:keyfind(do, 1, Body) of
+    {do, _} ->
+      [{Meta, Args, Guards, {'try', [{origin,  Kind} | Meta], [Body]}}];
+    false ->
+      elixir_errors:form_error(Meta, E, elixir_expand, {missing_option, Kind, [do]})
+  end.
+
+run_on_definition_callbacks(Kind, Module, Name, Args, Guards, Body, E) ->
+  {_, Bag} = elixir_module:data_tables(Module),
+  Callbacks = ets:lookup_element(Bag, {accumulate, on_definition}, 2),
+  _ = [Mod:Fun(E, Kind, Name, Args, Guards, Body) || {Mod, Fun} <- lists:reverse(Callbacks)],
+  ok.
+
+store_definition(Check, Kind, Meta, Name, Arity, File, Module, Defaults, Clauses) ->
+  {Set, Bag} = elixir_module:data_tables(Module),
+  Tuple = {Name, Arity},
+  HasBody = Clauses =/= [],
+
+  if
+    Defaults > 0 ->
+      ets:insert(Bag, {{default, Name}, Arity, Defaults});
+    true ->
+      ok
   end,
-  Check andalso ets:insert(Table, { last, { Name, Arity } }),
-  ets:insert(CTable, [{ Tuple, Clause } || Clause <- Clauses ]),
-  ets:insert(Table, { Tuple, Kind, FinalLine, File, Check, FinalLocation, FinalDefaults }).
+
+  {MaxDefaults, FirstMeta} =
+    case ets:lookup(Set, {def, Tuple}) of
+      [{_, StoredKind, StoredMeta, StoredFile, StoredCheck, {StoredDefaults, LastHasBody, LastDefaults}}] ->
+        check_valid_kind(Meta, File, Name, Arity, Kind, StoredKind, StoredFile, StoredMeta),
+        check_valid_defaults(Meta, File, Name, Arity, Kind, Defaults, StoredDefaults, LastDefaults, HasBody, LastHasBody),
+        (Check and StoredCheck) andalso
+          check_valid_clause(Meta, File, Name, Arity, Kind, Set, StoredMeta, StoredFile, Clauses),
+
+        {max(Defaults, StoredDefaults), StoredMeta};
+      [] ->
+        ets:insert(Bag, {defs, Tuple}),
+        {Defaults, Meta}
+    end,
+
+  Check andalso ets:insert(Set, {?last_def, Tuple}),
+  ets:insert(Bag, [{{clauses, Tuple}, Clause} || Clause <- Clauses]),
+  ets:insert(Set, {{def, Tuple}, Kind, FirstMeta, File, Check, {MaxDefaults, HasBody, Defaults}}).
+
+%% Handling of defaults
+
+unpack_defaults(Kind, Meta, Name, Args, E) ->
+  Expanded = expand_defaults(Args, E#{context := nil}),
+  unpack_defaults(Kind, Meta, Name, Expanded, [], []).
+
+unpack_defaults(Kind, Meta, Name, [{'\\\\', DefaultMeta, [Expr, _]} | T] = List, Acc, Clauses) ->
+  Base = match_defaults(Acc, length(Acc), []),
+  {Args, Invoke} = extract_defaults(List, length(Base), [], []),
+  Clause = {Meta, Base ++ Args, [], {super, [{super, {Kind, Name}} | DefaultMeta], Base ++ Invoke}},
+  unpack_defaults(Kind, Meta, Name, T, [Expr | Acc], [Clause | Clauses]);
+unpack_defaults(Kind, Meta, Name, [H | T], Acc, Clauses) ->
+  unpack_defaults(Kind, Meta, Name, T, [H | Acc], Clauses);
+unpack_defaults(_Kind, _Meta, _Name, [], Acc, Clauses) ->
+  {lists:reverse(Acc), lists:reverse(Clauses)}.
+
+expand_defaults([{'\\\\', Meta, [Expr, Default]} | Args], E) ->
+  {ExpandedDefault, _} = elixir_expand:expand(Default, E),
+  [{'\\\\', Meta, [Expr, ExpandedDefault]} | expand_defaults(Args, E)];
+expand_defaults([Arg | Args], E) ->
+  [Arg | expand_defaults(Args, E)];
+expand_defaults([], _E) ->
+  [].
+
+extract_defaults([{'\\\\', _, [_Expr, Default]} | T], Counter, NewArgs, NewInvoke) ->
+  extract_defaults(T, Counter, NewArgs, [Default | NewInvoke]);
+extract_defaults([_ | T], Counter, NewArgs, NewInvoke) ->
+  H = default_var(Counter),
+  extract_defaults(T, Counter + 1, [H | NewArgs], [H | NewInvoke]);
+extract_defaults([], _Counter, NewArgs, NewInvoke) ->
+  {lists:reverse(NewArgs), lists:reverse(NewInvoke)}.
+
+match_defaults([], 0, Acc) ->
+  Acc;
+match_defaults([_ | T], Counter, Acc) ->
+  NewCounter = Counter - 1,
+  match_defaults(T, NewCounter, [default_var(NewCounter) | Acc]).
+
+default_var(Counter) ->
+  {list_to_atom([$x | integer_to_list(Counter)]), [{generated, true}, {version, Counter}], ?var_context}.
 
 %% Validations
 
-check_valid_kind(_Line, _File, _Name, _Arity, Kind, Kind) -> [];
-check_valid_kind(Line, File, Name, Arity, Kind, StoredKind) ->
-  elixir_errors:form_error(Line, File, ?MODULE,
-    { changed_kind, { Name, Arity, StoredKind, Kind } }).
+check_valid_kind(_Meta, _File, _Name, _Arity, Kind, Kind, _StoredFile, _StoredMeta) -> ok;
+check_valid_kind(Meta, File, Name, Arity, Kind, StoredKind, StoredFile, StoredMeta) ->
+  elixir_errors:form_error(Meta, File, ?MODULE,
+    {changed_kind, {Name, Arity, StoredKind, Kind, StoredFile, ?line(StoredMeta)}}).
 
-check_valid_clause(Line, File, Name, Arity, Kind, Table, StoredLine, StoredFile) ->
-  case ets:lookup_element(Table, last, 2) of
-    {Name,Arity} -> [];
-    [] -> [];
+check_valid_clause(Meta, File, Name, Arity, Kind, Set, StoredMeta, StoredFile, Clauses) ->
+  case ets:lookup_element(Set, ?last_def, 2) of
+    none ->
+      ok;
+    {Name, Arity} when Clauses == [] ->
+      elixir_errors:form_warn(Meta, File, ?MODULE,
+        {late_function_head, {Kind, Name, Arity}});
+    {Name, Arity} ->
+      ok;
+    {Name, _} ->
+      Relative = elixir_utils:relative_to_cwd(StoredFile),
+      elixir_errors:form_warn(Meta, File, ?MODULE,
+        {ungrouped_name, {Kind, Name, Arity, ?line(StoredMeta), Relative}});
     _ ->
       Relative = elixir_utils:relative_to_cwd(StoredFile),
-      elixir_errors:handle_file_warning(File, { Line, ?MODULE,
-        { ungrouped_clause, { Kind, Name, Arity, StoredLine, Relative } } })
+      elixir_errors:form_warn(Meta, File, ?MODULE,
+        {ungrouped_arity, {Kind, Name, Arity, ?line(StoredMeta), Relative}})
   end.
 
-check_valid_defaults(_Line, _File, _Name, _Arity, _Kind, 0, _) -> [];
-check_valid_defaults(Line, File, Name, Arity, Kind, _, 0) ->
-  elixir_errors:handle_file_warning(File, { Line, ?MODULE, { out_of_order_defaults, { Kind, Name, Arity } } });
-check_valid_defaults(Line, File, Name, Arity, Kind, _, _) ->
-  elixir_errors:form_error(Line, File, ?MODULE, { clauses_with_defaults, { Kind, Name, Arity } }).
+% Clause with defaults after clause with defaults
+check_valid_defaults(Meta, File, Name, Arity, Kind, Defaults, StoredDefaults, _, _, _)
+    when Defaults > 0, StoredDefaults > 0 ->
+  elixir_errors:form_error(Meta, File, ?MODULE, {duplicate_defaults, {Kind, Name, Arity}});
+% Clause with defaults after clause without defaults
+check_valid_defaults(Meta, File, Name, Arity, Kind, Defaults, 0, _, _, _) when Defaults > 0 ->
+  elixir_errors:form_warn(Meta, File, ?MODULE, {mixed_defaults, {Kind, Name, Arity}});
+% Clause without defaults directly after clause with defaults (bodiless does not count)
+check_valid_defaults(Meta, File, Name, Arity, Kind, 0, _, LastDefaults, true, true) when LastDefaults > 0 ->
+  elixir_errors:form_warn(Meta, File, ?MODULE, {mixed_defaults, {Kind, Name, Arity}});
+% Clause without defaults
+check_valid_defaults(_Meta, _File, _Name, _Arity, _Kind, 0, _StoredDefaults, _LastDefaults, _HasBody, _LastHasBody) ->
+  ok.
 
-check_previous_defaults(Table, Line, Name, Arity, Kind, Defaults, S) ->
-  Matches = ets:match(Table, { { Name, '$2' }, '$1', '_', '_', '_', '_', '$3' }),
-  [ begin
-      elixir_errors:form_error(Line, S#elixir_scope.file, ?MODULE,
-        { defs_with_defaults, Name, { Kind, Arity }, { K, A } })
-    end || [K, A, D] <- Matches, A /= Arity, D /= 0, defaults_conflict(A, D, Arity, Defaults)].
+check_bodiless_function(Check, _Meta, _File, Module, _Kind, _Tuple)
+    when Check == false; Module == 'Elixir.Module' ->
+  ok;
+check_bodiless_function(_Check, Meta, File, _Module, Kind, Tuple) ->
+  elixir_errors:form_error(Meta, File, ?MODULE, {function_head, Kind, Tuple}).
+
+check_args_for_function_head(Meta, Args, E) ->
+  [begin
+     elixir_errors:form_error(Meta, E, ?MODULE, invalid_args_for_function_head)
+   end || Arg <- Args, invalid_arg(Arg)].
+
+invalid_arg({Name, _, Kind}) when is_atom(Name), is_atom(Kind) -> false;
+invalid_arg(_) -> true.
+
+check_previous_defaults(Meta, Module, Name, Arity, Kind, Defaults, E) ->
+  {_Set, Bag} = elixir_module:data_tables(Module),
+  Matches = ets:lookup(Bag, {default, Name}),
+  [begin
+     elixir_errors:form_error(Meta, E, ?MODULE,
+       {defs_with_defaults, Kind, Name, Arity, A})
+   end || {_, A, D} <- Matches, A /= Arity, D /= 0, defaults_conflict(A, D, Arity, Defaults)].
 
 defaults_conflict(A, D, Arity, Defaults) ->
   ((Arity >= (A - D)) andalso (Arity < A)) orelse
     ((A >= (Arity - Defaults)) andalso (A < Arity)).
 
-assert_no_aliases_name(Line, '__aliases__', [Atom], #elixir_scope{file=File}) when is_atom(Atom) ->
-  Message = "function names should start with lowercase characters or underscore, invalid name ~ts",
-  elixir_errors:syntax_error(Line, File, Message, [Atom]);
-
+assert_no_aliases_name(Meta, '__aliases__', [Atom], #{file := File}) when is_atom(Atom) ->
+  elixir_errors:form_error(Meta, File, ?MODULE, {no_alias, Atom});
 assert_no_aliases_name(_Meta, _Aliases, _Args, _S) ->
+  ok.
+
+assert_valid_name(Meta, Kind, '__info__', [_], #{file := File}) ->
+  elixir_errors:form_error(Meta, File, ?MODULE, {'__info__', Kind});
+assert_valid_name(Meta, Kind, 'module_info', [], #{file := File}) ->
+  elixir_errors:form_error(Meta, File, ?MODULE, {module_info, Kind, 0});
+assert_valid_name(Meta, Kind, 'module_info', [_], #{file := File}) ->
+  elixir_errors:form_error(Meta, File, ?MODULE, {module_info, Kind, 1});
+assert_valid_name(Meta, Kind, is_record, [_, _], #{file := File}) when Kind == defp; Kind == def ->
+  elixir_errors:form_error(Meta, File, ?MODULE, {is_record, Kind});
+assert_valid_name(_Meta, _Kind, _Name, _Args, _S) ->
   ok.
 
 %% Format errors
 
-format_error({no_module,{Kind,Name,Arity}}) ->
+format_error({function_head, Kind, {Name, Arity}}) ->
+  io_lib:format("implementation not provided for predefined ~ts ~ts/~B", [Kind, Name, Arity]);
+
+format_error({no_module, {Kind, Name, Arity}}) ->
   io_lib:format("cannot define function outside module, invalid scope for ~ts ~ts/~B", [Kind, Name, Arity]);
 
-format_error({defs_with_defaults, Name, { Kind, Arity }, { K, A } }) when Arity > A ->
-  io_lib:format("~ts ~ts/~B defaults conflicts with ~ts ~ts/~B",
-    [Kind, Name, Arity, K, Name, A]);
+format_error({defs_with_defaults, Kind, Name, Arity, A}) when Arity > A ->
+  io_lib:format("~ts ~ts/~B defaults conflicts with ~ts/~B",
+    [Kind, Name, Arity, Name, A]);
 
-format_error({defs_with_defaults, Name, { Kind, Arity }, { K, A } }) when Arity < A ->
-  io_lib:format("~ts ~ts/~B conflicts with defaults from ~ts ~ts/~B",
-    [Kind, Name, Arity, K, Name, A]);
+format_error({defs_with_defaults, Kind, Name, Arity, A}) when Arity < A ->
+  io_lib:format("~ts ~ts/~B conflicts with defaults from ~ts/~B",
+    [Kind, Name, Arity, Name, A]);
 
-format_error({clauses_with_defaults,{Kind,Name,Arity}}) ->
-  io_lib:format("~ts ~ts/~B has default values and multiple clauses, "
-    "use a separate clause for declaring defaults", [Kind, Name, Arity]);
+format_error({duplicate_defaults, {Kind, Name, Arity}}) ->
+  io_lib:format(
+    "~ts ~ts/~B defines defaults multiple times. "
+    "Elixir allows defaults to be declared once per definition. Instead of:\n"
+    "\n"
+    "    def foo(:first_clause, b \\\\ :default) do ... end\n"
+    "    def foo(:second_clause, b \\\\ :default) do ... end\n"
+    "\n"
+    "one should write:\n"
+    "\n"
+    "    def foo(a, b \\\\ :default)\n"
+    "    def foo(:first_clause, b) do ... end\n"
+    "    def foo(:second_clause, b) do ... end\n",
+    [Kind, Name, Arity]);
 
-format_error({out_of_order_defaults,{Kind,Name,Arity}}) ->
-  io_lib:format("clause with defaults should be the first clause in ~ts ~ts/~B", [Kind, Name, Arity]);
+format_error({mixed_defaults, {Kind, Name, Arity}}) ->
+  io_lib:format(
+    "~ts ~ts/~B has multiple clauses and also declares default values. "
+    "In such cases, the default values should be defined in a header. Instead of:\n"
+    "\n"
+    "    def foo(:first_clause, b \\\\ :default) do ... end\n"
+    "    def foo(:second_clause, b) do ... end\n"
+    "\n"
+    "one should write:\n"
+    "\n"
+    "    def foo(a, b \\\\ :default)\n"
+    "    def foo(:first_clause, b) do ... end\n"
+    "    def foo(:second_clause, b) do ... end\n",
+    [Kind, Name, Arity]);
 
-format_error({ungrouped_clause,{Kind,Name,Arity,OrigLine,OrigFile}}) ->
-  io_lib:format("clauses for the same ~ts should be grouped together, ~ts ~ts/~B was previously defined (~ts:~B)",
-    [Kind, Kind, Name, Arity, OrigFile, OrigLine]);
+format_error({ungrouped_name, {Kind, Name, Arity, OrigLine, OrigFile}}) ->
+   io_lib:format("clauses with the same name should be grouped together, \"~ts ~ts/~B\" was previously defined (~ts:~B)",
+     [Kind, Name, Arity, OrigFile, OrigLine]);
 
-format_error({changed_kind,{Name,Arity,Previous,Current}}) ->
-  io_lib:format("~ts ~ts/~B already defined as ~ts", [Current, Name, Arity, Previous]).
+format_error({ungrouped_arity, {Kind, Name, Arity, OrigLine, OrigFile}}) ->
+  io_lib:format("clauses with the same name and arity (number of arguments) should be grouped together, \"~ts ~ts/~B\" was previously defined (~ts:~B)",
+    [Kind, Name, Arity, OrigFile, OrigLine]);
+
+format_error({late_function_head, {Kind, Name, Arity}}) ->
+  io_lib:format("function head for ~ts ~ts/~B must come at the top of its direct implementation. Instead of:\n"
+    "\n"
+    "    def add(a, b), do: a + b\n"
+    "    def add(a, b)\n"
+    "\n"
+    "one should write:\n"
+    "\n"
+    "    def add(a, b)\n"
+    "    def add(a, b), do: a + b\n",
+    [Kind, Name, Arity]);
+
+format_error({changed_kind, {Name, Arity, Previous, Current, OrigFile, OrigLine}}) ->
+  OrigFileRelative = elixir_utils:relative_to_cwd(OrigFile),
+  io_lib:format("~ts ~ts/~B already defined as ~ts in ~ts:~B", [Current, Name, Arity, Previous, OrigFileRelative, OrigLine]);
+
+format_error({no_alias, Atom}) ->
+  io_lib:format("function names should start with lowercase characters or underscore, invalid name ~ts", [Atom]);
+
+format_error({invalid_def, Kind, NameAndArgs}) ->
+  io_lib:format("invalid syntax in ~ts ~ts", [Kind, 'Elixir.Macro':to_string(NameAndArgs)]);
+
+format_error(invalid_args_for_function_head) ->
+  "only variables and \\\\ are allowed as arguments in function head.\n"
+  "\n"
+  "If you did not intend to define a function head, make sure your function "
+  "definition has the proper syntax by wrapping the arguments in parentheses "
+  "and using the do instruction accordingly:\n\n"
+  "    def add(a, b), do: a + b\n\n"
+  "    def add(a, b) do\n"
+  "      a + b\n"
+  "    end\n";
+
+format_error({'__info__', Kind}) ->
+  io_lib:format("cannot define ~ts __info__/1 as it is automatically defined by Elixir", [Kind]);
+
+format_error({module_info, Kind, Arity}) ->
+  io_lib:format("cannot define ~ts module_info/~B as it is automatically defined by Erlang", [Kind, Arity]);
+
+format_error({is_record, Kind}) ->
+  io_lib:format("cannot define ~ts is_record/2 due to compatibility "
+                "issues with the Erlang compiler (it is a known limitation)", [Kind]).

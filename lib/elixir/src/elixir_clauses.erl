@@ -1,263 +1,415 @@
 %% Handle code related to args, guard and -> matching for case,
 %% fn, receive and friends. try is handled in elixir_try.
 -module(elixir_clauses).
--export([
-  assigns/3, assigns_block/5, assigns_block/6, extract_splat_guards/1,
-  get_pairs/4, get_pairs/5, match/3, extract_args/1, extract_guards/1]).
+-export([match/4, clause/5, def/2, head/2, head/3,
+         'case'/3, 'receive'/3, 'try'/3, 'cond'/3, with/3,
+         format_error/1]).
+-import(elixir_errors, [form_error/4, form_warn/4]).
 -include("elixir.hrl").
 
-%% Get pairs from a clause.
+match(Fun, Expr, E, #{context := match}) ->
+  Fun(Expr, E);
+match(Fun, Expr, #{current_vars := Current, unused_vars := {_, Counter} = Unused} = AfterE, BeforeE) ->
+  #{
+    context := Context,
+    prematch_vars := Prematch,
+    current_vars := {Read, _}
+  } = BeforeE,
 
-get_pairs(Meta, Key, Clauses, S) ->
-  get_pairs(Meta, Key, Clauses, S, false).
-
-get_pairs(Meta, Key, Clauses, S, AllowNil) ->
-  case lists:keyfind(Key, 1, Clauses) of
-    { Key, { '->', _, Pairs } } ->
-      [{ Key, PMeta, Left, Right } || { Left, PMeta, Right } <- Pairs];
-    { Key, nil } when AllowNil ->
-      [];
-    { Key, _ } ->
-      elixir_errors:syntax_error(Meta, S#elixir_scope.file, "expected pairs with -> for key ~ts", [Key]);
-    _ ->
-      []
-  end.
-
-% Function for translating assigns.
-
-assigns(Fun, Args, #elixir_scope{context=Context, temp_vars=TempVars,
-    backup_vars=BackupVars, vars=Vars} = S) when Context /= match ->
-  { Result, NewS } = assigns(Fun, Args, S#elixir_scope{context=match,
-                       temp_vars=ordsets:new(), backup_vars=Vars}),
-  { Result, NewS#elixir_scope{context=Context,
-      temp_vars=TempVars, backup_vars=BackupVars} };
-
-assigns(Fun, Args, S) -> Fun(Args, S).
-
-%% Function for translating a block that is preceeded by an
-%% assignment and optional guards. This is used by def* and fn.
-
-assigns_block(Line, Fun, BareArgs, Exprs, S) ->
-  { Args, Guards } = extract_guards(BareArgs),
-  assigns_block(Line, Fun, Args, Exprs, Guards, S).
-
-assigns_block(Line, Fun, Args, Exprs, Guards, S) when is_integer(Line) ->
-  { TArgs, SA }  = assigns(Fun, Args, S#elixir_scope{extra_guards=[]}),
-  { TExprs, SE } = elixir_translator:translate(Exprs, SA#elixir_scope{extra_guards=nil}),
-
-  FArgs   = listify(TArgs),
-  SG      = SA#elixir_scope{context=guard, extra_guards=nil},
-  Extra   = SA#elixir_scope.extra_guards,
-
-  FGuards = case Guards of
-    [] -> case Extra of [] -> []; _ -> [Extra] end;
-    _  -> [translate_guard(Line, Guard, Extra, SG) || Guard <- Guards]
-  end,
-
-  % Uncompact expressions from the block.
-  case TExprs of
-    [{ block, _, FExprs }] -> [];
-    _ -> FExprs = TExprs
-  end,
-
-  { { clause, Line, FArgs, FGuards, FExprs }, SE }.
-
-% Translate/Extract guards from the given expression.
-
-translate_guard(Line, Guard, Extra, S) ->
-  [element(1, elixir_translator:translate_each(elixir_quote:linify(Line, Guard), S))|Extra].
-
-extract_guards({ 'when', _, [Left, Right] }) -> { Left, extract_or_clauses(Right, []) };
-extract_guards(Else) -> { Else, [] }.
-
-extract_or_clauses({ 'when', _, [Left, Right] }, Acc) -> extract_or_clauses(Right, [Left|Acc]);
-extract_or_clauses(Term, Acc) -> [Term|Acc].
-
-% Extract name and args from the given expression.
-
-extract_args({ { '.', _, [Name] }, _, Args }) when is_atom(Name), is_list(Args) -> { Name, Args };
-extract_args({ Name, _, Args }) when is_atom(Name), is_atom(Args) -> { Name, [] };
-extract_args({ Name, _, Args }) when is_atom(Name), is_list(Args) -> { Name, Args };
-extract_args(_) -> error.
-
-% Extract guards when multiple left side args are allowed.
-
-extract_splat_guards([{ 'when', _, [_,_|_] = Args }]) ->
-  { Left, Right } = elixir_utils:split_last(Args),
-  { Left, extract_or_clauses(Right, []) };
-extract_splat_guards(Else) ->
-  { Else, [] }.
-
-% Function for translating macros with match style like case and receive.
-
-match(Meta, Clauses, #elixir_scope{clause_vars=C1} = S) ->
-  { TC, TS } = do_match(Meta, Clauses, S#elixir_scope{clause_vars=orddict:new()}),
-  C2 = TS#elixir_scope.clause_vars,
-  { TC, TS#elixir_scope{clause_vars=elixir_scope:merge_clause_vars(C1, C2)} }.
-
-do_match(_Meta, [], S) ->
-  { [], S };
-
-do_match(_Meta, [DecoupledClause], S) ->
-  { TDecoupledClause, TS } = each_clause(DecoupledClause, S),
-  { [TDecoupledClause], TS };
-
-do_match(Meta, DecoupledClauses, S) ->
-  % Transform tree just passing the variables counter forward
-  % and storing variables defined inside each clause.
-  Transformer = fun(X, {Acc, CV}) ->
-    { TX, TAcc } = each_clause(X, Acc),
-    { TX, { merge_clauses_scope(S, TAcc), [TAcc#elixir_scope.clause_vars|CV] } }
-  end,
-
-  { TClauses, { TS, ReverseCV } } = lists:mapfoldl(Transformer, {S, []}, DecoupledClauses),
-
-  % Now get all the variables defined inside each clause
-  CV = lists:reverse(ReverseCV),
-  AllVars = lists:foldl(fun(KV, Acc) ->
-    elixir_scope:merge_clause_vars(Acc, KV)
-  end, orddict:new(), CV),
-
-  % Create a new scope that contains a list of all variables
-  % defined inside all the clauses. It returns this new scope and
-  % a list of tuples where the first element is the variable name,
-  % the second one is the new pointer to the variable and the third
-  % is the old pointer.
-  { FinalVars, FS } = lists:mapfoldl(fun({ Key, Ref }, Acc) ->
-    normalize_vars(Key, Ref, Acc)
-  end, TS, AllVars),
-
-  % Expand all clauses by adding a match operation at the end
-  % that assigns variables missing in one clause to the others.
-  expand_clauses(?line(Meta), TClauses, CV, FinalVars, [], FS).
-
-expand_clauses(Line, [Clause|T], [ClauseVars|V], FinalVars, Acc, S) ->
-  case generate_match_vars(FinalVars, ClauseVars, [], []) of
-    { [], [] } ->
-      expand_clauses(Line, T, V, FinalVars, [Clause|Acc], S);
-    { Left, Right } ->
-      MatchExpr   = generate_match(Line, Left, Right),
-      ClauseExprs = element(5, Clause),
-      [Final|RawClauseExprs] = lists:reverse(ClauseExprs),
-
-      % If the last sentence has a match clause, we need to assign its value
-      % in the variable list. If not, we insert the variable list before the
-      % final clause in order to keep it tail call optimized.
-      { FinalClauseExprs, FS } = case has_match_tuple(Final) of
-        true ->
-          case Final of
-            { match, _, { var, _, UserVarName } = UserVar, _ } when UserVarName /= '_' ->
-              { [UserVar,MatchExpr,Final|RawClauseExprs], S };
-            _ ->
-              { StorageVar, SS } = elixir_scope:build_erl_var(Line, S),
-              StorageExpr = { match, Line, StorageVar, Final },
-              { [StorageVar,MatchExpr,StorageExpr|RawClauseExprs], SS }
-          end;
-        false ->
-          { [Final,MatchExpr|RawClauseExprs], S }
-      end,
-
-      FinalClause = setelement(5, Clause, lists:reverse(FinalClauseExprs)),
-      expand_clauses(Line, T, V, FinalVars, [FinalClause|Acc], FS)
-  end;
-
-expand_clauses(_Line, [], [], _FinalVars, Acc, S) ->
-  { lists:reverse(Acc), S }.
-
-% Handle each key/value clause pair and translate them accordingly.
-
-each_clause({ do, Meta, [Condition], Expr }, S) ->
-  assigns_block(?line(Meta), fun elixir_translator:translate_each/2, Condition, [Expr], S);
-
-each_clause({ else, Meta, [Condition], Expr }, S) ->
-  assigns_block(?line(Meta), fun elixir_translator:translate_each/2, Condition, [Expr], S);
-
-each_clause({ 'after', Meta, [Condition], Expr }, S) ->
-  { TCondition, SC } = elixir_translator:translate_each(Condition, S),
-  { TBody, SB } = elixir_translator:translate([Expr], SC),
-  { { clause, ?line(Meta), [TCondition], [], TBody }, SB };
-
-each_clause({ Key, Meta, [_|_], _ }, S) when Key == do; Key == 'after' ->
-  elixir_errors:syntax_error(Meta, S#elixir_scope.file, "too many arguments given for ~ts", [Key]);
-
-each_clause({ Key, Meta, _, _ }, S) ->
-  elixir_errors:syntax_error(Meta, S#elixir_scope.file, "invalid key ~ts", [Key]).
-
-% Check if the given expression is a match tuple.
-% This is a small optimization to allow us to change
-% existing assignments instead of creating new ones every time.
-
-has_match_tuple({'receive', _, _, _, _}) ->
-  true;
-
-has_match_tuple({'receive', _, _}) ->
-  true;
-
-has_match_tuple({'case', _, _, _}) ->
-  true;
-
-has_match_tuple({match, _, _, _}) ->
-  true;
-
-has_match_tuple({'fun', _, { clauses, _ }}) ->
-  false;
-
-has_match_tuple(H) when is_tuple(H) ->
-  has_match_tuple(tuple_to_list(H));
-
-has_match_tuple(H) when is_list(H) ->
-  lists:any(fun has_match_tuple/1, H);
-
-has_match_tuple(_) -> false.
-
-% Normalize the given var in between clauses
-% by picking one value as reference and retriving
-% its previous value.
-
-normalize_vars(Key, Value, #elixir_scope{vars=Vars,clause_vars=ClauseVars} = S) ->
-  FS = S#elixir_scope{
-    vars=orddict:store(Key, Value, Vars),
-    clause_vars=orddict:store(Key, Value, ClauseVars)
+  CallE = BeforeE#{
+    context := match,
+    prematch_vars := {Read, Counter},
+    current_vars := Current,
+    unused_vars := Unused
   },
 
-  Expr = case orddict:find(Key, Vars) of
-    { ok, OldValue } -> { var, 0, OldValue };
-    error -> { atom, 0, nil }
+  {EExpr, #{current_vars := NewCurrent, unused_vars := NewUnused}} = Fun(Expr, CallE),
+
+  EndE = AfterE#{
+    context := Context,
+    prematch_vars := Prematch,
+    current_vars := NewCurrent,
+    unused_vars := NewUnused
+  },
+
+  {EExpr, EndE}.
+
+def({Meta, Args, Guards, Body}, E) ->
+  {EArgs, EA}   = elixir_expand:expand_args(Args, E#{context := match, prematch_vars := {#{}, 0}}),
+  {EGuards, EG} = guard(Guards, EA#{context := guard, prematch_vars := warn}),
+  {EBody, EB}   = elixir_expand:expand(Body, EG#{context := nil}),
+  elixir_env:check_unused_vars(EB),
+  {Meta, EArgs, EGuards, EBody}.
+
+clause(Meta, Kind, Fun, {'->', ClauseMeta, [_, _]} = Clause, E) when is_function(Fun, 3) ->
+  clause(Meta, Kind, fun(X, Acc) -> Fun(ClauseMeta, X, Acc) end, Clause, E);
+clause(_Meta, _Kind, Fun, {'->', Meta, [Left, Right]}, E) ->
+  {ELeft, EL}  = Fun(Left, E),
+  {ERight, ER} = elixir_expand:expand(Right, EL),
+  {{'->', Meta, [ELeft, ERight]}, ER};
+clause(Meta, Kind, _Fun, _, E) ->
+  form_error(Meta, E, ?MODULE, {bad_or_missing_clauses, Kind}).
+
+head(Args, E) ->
+  head(Args, E, E).
+head([{'when', Meta, [_ | _] = All}], AfterE, BeforeE) ->
+  {Args, Guard} = elixir_utils:split_last(All),
+
+  {{EArgs, EGuard}, EG} =
+    match(fun(ok, EM) ->
+      {EArgs, EA} = elixir_expand:expand_args(Args, EM),
+      {EGuard, EG} = guard(Guard, EA#{context := guard, prematch_vars := ?key(BeforeE, prematch_vars)}),
+      {{EArgs, EGuard}, EG}
+    end, ok, AfterE, BeforeE),
+
+  {[{'when', Meta, EArgs ++ [EGuard]}], EG};
+head(Args, AfterE, BeforeE) ->
+  match(fun elixir_expand:expand_args/2, Args, AfterE, BeforeE).
+
+guard({'when', Meta, [Left, Right]}, E) ->
+  {ELeft, EL}  = guard(Left, E),
+  {ERight, ER} = guard(Right, EL),
+  {{'when', Meta, [ELeft, ERight]}, ER};
+guard(Guard, E) ->
+  {EGuard, EG} = elixir_expand:expand(Guard, E),
+  warn_zero_length_guard(EGuard, EG),
+  {EGuard, EG}.
+
+warn_zero_length_guard({{'.', _, [erlang, Op]}, Meta,
+                        [{{'.', _, [erlang, length]}, _, [Arg]}, 0]}, E) when Op == '=='; Op == '>' ->
+  Warn =
+    case Op of
+      '==' -> {zero_list_length_in_guard, Arg};
+      '>' -> {positive_list_length_in_guard, Arg}
+    end,
+  form_warn(Meta, ?key(E, file), ?MODULE, Warn);
+warn_zero_length_guard({Op, _, [L, R]}, E) when Op == 'or'; Op == 'and' ->
+  warn_zero_length_guard(L, E),
+  warn_zero_length_guard(R, E);
+warn_zero_length_guard(_, _) ->
+  ok.
+
+%% Case
+
+'case'(Meta, [], E) ->
+  form_error(Meta, E, elixir_expand, {missing_option, 'case', [do]});
+'case'(Meta, Opts, E) when not is_list(Opts) ->
+  form_error(Meta, E, elixir_expand, {invalid_args, 'case'});
+'case'(Meta, Opts, E) ->
+  ok = assert_at_most_once('do', Opts, 0, fun(Key) ->
+    form_error(Meta, E, ?MODULE, {duplicated_clauses, 'case', Key})
+  end),
+  lists:mapfoldl(fun(X, Acc) -> expand_case(Meta, X, Acc) end, E, Opts).
+
+expand_case(Meta, {'do', _} = Do, E) ->
+  Fun = expand_head(Meta, 'case', 'do'),
+  expand_clauses(Meta, 'case', Fun, Do, E);
+expand_case(Meta, {Key, _}, E) ->
+  form_error(Meta, E, ?MODULE, {unexpected_option, 'case', Key}).
+
+%% Cond
+
+'cond'(Meta, [], E) ->
+  form_error(Meta, E, elixir_expand, {missing_option, 'cond', [do]});
+'cond'(Meta, Opts, E) when not is_list(Opts) ->
+  form_error(Meta, E, elixir_expand, {invalid_args, 'cond'});
+'cond'(Meta, Opts, E) ->
+  ok = assert_at_most_once('do', Opts, 0, fun(Key) ->
+    form_error(Meta, E, ?MODULE, {duplicated_clauses, 'cond', Key})
+  end),
+  lists:mapfoldl(fun(X, Acc) -> expand_cond(Meta, X, Acc) end, E, Opts).
+
+expand_cond(Meta, {'do', _} = Do, E) ->
+  Fun = expand_one(Meta, 'cond', 'do', fun elixir_expand:expand_args/2),
+  expand_clauses(Meta, 'cond', Fun, Do, E);
+expand_cond(Meta, {Key, _}, E) ->
+  form_error(Meta, E, ?MODULE, {unexpected_option, 'cond', Key}).
+
+%% Receive
+
+'receive'(Meta, [], E) ->
+  form_error(Meta, E, elixir_expand, {missing_option, 'receive', [do, 'after']});
+'receive'(Meta, Opts, E) when not is_list(Opts) ->
+  form_error(Meta, E, elixir_expand, {invalid_args, 'receive'});
+'receive'(Meta, Opts, E) ->
+  RaiseError = fun(Key) ->
+    form_error(Meta, E, ?MODULE, {duplicated_clauses, 'receive', Key})
+  end,
+  ok = assert_at_most_once('do', Opts, 0, RaiseError),
+  ok = assert_at_most_once('after', Opts, 0, RaiseError),
+  lists:mapfoldl(fun(X, Acc) -> expand_receive(Meta, X, Acc) end, E, Opts).
+
+expand_receive(_Meta, {'do', {'__block__', _, []}} = Do, E) ->
+  {Do, E};
+expand_receive(Meta, {'do', _} = Do, E) ->
+  Fun = expand_head(Meta, 'receive', 'do'),
+  expand_clauses(Meta, 'receive', Fun, Do, E);
+expand_receive(Meta, {'after', [_]} = After, E) ->
+  Fun = expand_one(Meta, 'receive', 'after', fun elixir_expand:expand_args/2),
+  expand_clauses(Meta, 'receive', Fun, After, E);
+expand_receive(Meta, {'after', _}, E) ->
+  form_error(Meta, E, ?MODULE, multiple_after_clauses_in_receive);
+expand_receive(Meta, {Key, _}, E) ->
+  form_error(Meta, E, ?MODULE, {unexpected_option, 'receive', Key}).
+
+%% With
+
+with(Meta, Args, E) ->
+  {Exprs, Opts0} =
+    case elixir_utils:split_last(Args) of
+      {_, LastArg} = SplitResult when is_list(LastArg) ->
+        SplitResult;
+      _ ->
+        {Args, []}
+    end,
+
+  E0 = elixir_env:reset_unused_vars(E),
+  {EExprs, {E1, HasMatch}} = lists:mapfoldl(fun expand_with/2, {E0, false}, Exprs),
+  {EDo, Opts1, E2} = expand_with_do(Meta, Opts0, E, E1),
+  {EOpts, Opts2, E3} = expand_with_else(Meta, Opts1, E2, HasMatch),
+
+  case Opts2 of
+    [{Key, _} | _] ->
+      form_error(Meta, E, elixir_clauses, {unexpected_option, with, Key});
+    [] ->
+      ok
   end,
 
-  { { Key, Value, Expr }, FS }.
+  {{with, Meta, EExprs ++ [[{do, EDo} | EOpts]]}, E3}.
 
-% Generate match vars by checking if they were updated
-% or not and assigning the previous value.
+expand_with({'<-', Meta, [{Name, _, Ctx}, _] = Args}, Acc) when is_atom(Name), is_atom(Ctx) ->
+  expand_with({'=', Meta, Args}, Acc);
+expand_with({'<-', Meta, [Left, Right]}, {E, _HasMatch}) ->
+  {ERight, ER} = elixir_expand:expand(Right, E),
+  {[ELeft], EL}  = head([Left], ER, E),
+  {{'<-', Meta, [ELeft, ERight]}, {EL, true}};
+expand_with(Expr, {E, HasMatch}) ->
+  {EExpr, EE} = elixir_expand:expand(Expr, E),
+  {EExpr, {EE, HasMatch}}.
 
-generate_match_vars([{ Key, NewValue, OldValue }|T], ClauseVars, Left, Right) ->
-  case orddict:find(Key, ClauseVars) of
-    { ok, NewValue } ->
-      generate_match_vars(T, ClauseVars, Left, Right);
-    { ok, ClauseValue } ->
-      generate_match_vars(T, ClauseVars, [{ var, 0, NewValue }|Left], [{ var, 0, ClauseValue }|Right]);
-    error ->
-      generate_match_vars(T, ClauseVars, [{ var, 0, NewValue }|Left], [OldValue|Right])
+expand_with_do(Meta, Opts, E, Acc) ->
+  case lists:keytake(do, 1, Opts) of
+    {value, {do, Expr}, RestOpts} ->
+      {EExpr, EAcc} = elixir_expand:expand(Expr, Acc),
+      {EExpr, RestOpts, elixir_env:merge_and_check_unused_vars(E, EAcc)};
+    false ->
+      form_error(Meta, E, elixir_expand, {missing_option, 'with', [do]})
+  end.
+
+expand_with_else(Meta, Opts, E, HasMatch) ->
+  case lists:keytake(else, 1, Opts) of
+    {value, Pair, RestOpts} ->
+      if
+        HasMatch -> ok;
+        true -> form_warn(Meta, ?key(E, file), ?MODULE, unmatchable_else_in_with)
+      end,
+      Fun = expand_head(Meta, 'with', 'else'),
+      {EPair, EE} = expand_clauses(Meta, 'with', Fun, Pair, E),
+      {[EPair], RestOpts, EE};
+    false ->
+      {[], Opts, E}
+  end.
+
+%% Try
+
+'try'(Meta, [], E) ->
+  form_error(Meta, E, elixir_expand, {missing_option, 'try', [do]});
+'try'(Meta, [{do, _}], E) ->
+  form_error(Meta, E, elixir_expand, {missing_option, 'try', ['catch', 'rescue', 'after']});
+'try'(Meta, Opts, E) when not is_list(Opts) ->
+  form_error(Meta, E, elixir_expand, {invalid_args, 'try'});
+'try'(Meta, Opts, E) ->
+  % TODO: Make this an error on v2.0
+  case Opts of
+    [{do, _}, {else, _}] ->
+      form_warn(Meta, ?key(E, file), ?MODULE, {try_with_only_else_clause, origin(Meta, 'try')});
+    _ ->
+      ok
+  end,
+  RaiseError = fun(Key) ->
+    form_error(Meta, E, ?MODULE, {duplicated_clauses, 'try', Key})
+  end,
+  ok = assert_at_most_once('do', Opts, 0, RaiseError),
+  ok = assert_at_most_once('rescue', Opts, 0, RaiseError),
+  ok = assert_at_most_once('catch', Opts, 0, RaiseError),
+  ok = assert_at_most_once('else', Opts, 0, RaiseError),
+  ok = assert_at_most_once('after', Opts, 0, RaiseError),
+  ok = warn_catch_before_rescue(Opts, Meta, E, false),
+  lists:mapfoldl(fun(X, Acc) -> expand_try(Meta, X, Acc) end, E, Opts).
+
+expand_try(_Meta, {'do', Expr}, E) ->
+  {EExpr, EE} = elixir_expand:expand(Expr, elixir_env:reset_unused_vars(E)),
+  {{'do', EExpr}, elixir_env:merge_and_check_unused_vars(E, EE)};
+expand_try(_Meta, {'after', Expr}, E) ->
+  {EExpr, EE} = elixir_expand:expand(Expr, elixir_env:reset_unused_vars(E)),
+  {{'after', EExpr}, elixir_env:merge_and_check_unused_vars(E, EE)};
+expand_try(Meta, {'else', _} = Else, E) ->
+  Fun = expand_head(Meta, 'try', 'else'),
+  expand_clauses(Meta, 'try', Fun, Else, E);
+expand_try(Meta, {'catch', _} = Catch, E) ->
+  expand_clauses_with_stacktrace(Meta, fun expand_catch/3, Catch, E);
+expand_try(Meta, {'rescue', _} = Rescue, E) ->
+  expand_clauses_with_stacktrace(Meta, fun expand_rescue/3, Rescue, E);
+expand_try(Meta, {Key, _}, E) ->
+  form_error(Meta, E, ?MODULE, {unexpected_option, 'try', Key}).
+
+expand_clauses_with_stacktrace(Meta, Fun, Clauses, E) ->
+  OldContextualVars = ?key(E, contextual_vars),
+  ES = E#{contextual_vars := ['__STACKTRACE__' | OldContextualVars]},
+  {Ret, EE} = expand_clauses(Meta, 'try', Fun, Clauses, ES),
+  {Ret, EE#{contextual_vars := OldContextualVars}}.
+
+expand_catch(_Meta, [_] = Args, E) ->
+  head(Args, E);
+expand_catch(_Meta, [_, _] = Args, E) ->
+  head(Args, E);
+expand_catch(Meta, _, E) ->
+  Error = {wrong_number_of_args_for_clause, "one or two args", origin(Meta, 'try'), 'catch'},
+  form_error(Meta, E, ?MODULE, Error).
+
+expand_rescue(Meta, [Arg], E) ->
+  case expand_rescue(Arg, E) of
+    {EArg, EA} ->
+      {[EArg], EA};
+    false ->
+      form_error(Meta, E, ?MODULE, invalid_rescue_clause)
+  end;
+expand_rescue(Meta, _, E) ->
+  Error = {wrong_number_of_args_for_clause, "one argument", origin(Meta, 'try'), 'rescue'},
+  form_error(Meta, E, ?MODULE, Error).
+
+%% rescue var
+expand_rescue({Name, _, Atom} = Var, E) when is_atom(Name), is_atom(Atom) ->
+  match(fun elixir_expand:expand/2, Var, E, E);
+
+%% rescue var in _ => rescue var
+expand_rescue({in, _, [{Name, _, VarContext} = Var, {'_', _, UnderscoreContext}]}, E)
+    when is_atom(Name), is_atom(VarContext), is_atom(UnderscoreContext) ->
+  expand_rescue(Var, E);
+
+%% rescue var in [Exprs]
+expand_rescue({in, Meta, [Left, Right]}, E) ->
+  {ELeft, EL}  = match(fun elixir_expand:expand/2, Left, E, E),
+  {ERight, ER} = elixir_expand:expand(Right, EL),
+
+  case ELeft of
+    {Name, _, Atom} when is_atom(Name), is_atom(Atom) ->
+      case normalize_rescue(ERight) of
+        false -> false;
+        Other -> {{in, Meta, [ELeft, Other]}, ER}
+      end;
+    _ ->
+      false
   end;
 
-generate_match_vars([], _ClauseVars, Left, Right) ->
-  { Left, Right }.
+%% rescue Error => _ in [Error]
+expand_rescue(Arg, E) ->
+  expand_rescue({in, [], [{'_', [], ?key(E, module)}, Arg]}, E).
 
-generate_match(Line, [Left], [Right]) ->
-  { match, Line, Left, Right };
+normalize_rescue({'_', _, Atom} = N) when is_atom(Atom) -> N;
+normalize_rescue(Atom) when is_atom(Atom) -> [Atom];
+normalize_rescue(Other) ->
+  is_list(Other) andalso lists:all(fun is_atom/1, Other) andalso Other.
 
-generate_match(Line, LeftVars, RightVars) ->
-  { match, Line, { tuple, Line, LeftVars }, { tuple, Line, RightVars } }.
+%% Expansion helpers
 
-listify(Expr) when not is_list(Expr) -> [Expr];
-listify(Expr) -> Expr.
+expand_head(Meta, Kind, Key) ->
+  fun
+    ([{'when', _, [_, _, _ | _]}], E) ->
+      form_error(Meta, E, ?MODULE, {wrong_number_of_args_for_clause, "one argument", Kind, Key});
+    ([_] = Args, E) ->
+      head(Args, E);
+    (_, E) ->
+      form_error(Meta, E, ?MODULE, {wrong_number_of_args_for_clause, "one argument", Kind, Key})
+  end.
 
-%% We don't use umergec because imports, aliases and
-%% what not are not passed from one clause to the other.
-merge_clauses_scope(S1, S2) ->
-  S1#elixir_scope{
-    counter=S2#elixir_scope.counter,
-    extra_guards=S2#elixir_scope.extra_guards,
-    super=S1#elixir_scope.super orelse S2#elixir_scope.super,
-    caller=S1#elixir_scope.caller orelse S2#elixir_scope.caller
-  }.
+%% Returns a function that expands arguments
+%% considering we have at maximum one entry.
+expand_one(Meta, Kind, Key, Fun) ->
+  fun
+    ([_] = Args, E) ->
+      Fun(Args, E);
+    (_, E) ->
+      form_error(Meta, E, ?MODULE, {wrong_number_of_args_for_clause, "one argument", Kind, Key})
+  end.
+
+%% Expands all -> pairs in a given key but do not keep the overall vars.
+expand_clauses(Meta, Kind, Fun, Clauses, E) ->
+  NewKind = origin(Meta, Kind),
+  expand_clauses_origin(Meta, NewKind, Fun, Clauses, E).
+
+expand_clauses_origin(Meta, Kind, Fun, {Key, [_ | _] = Clauses}, E) ->
+  Transformer = fun(Clause, Acc) ->
+    {EClause, EAcc} = clause(Meta, {Kind, Key}, Fun, Clause, elixir_env:reset_unused_vars(Acc)),
+    {EClause, elixir_env:merge_and_check_unused_vars(Acc, EAcc)}
+  end,
+  {Values, EE} = lists:mapfoldl(Transformer, E, Clauses),
+  {{Key, Values}, EE};
+expand_clauses_origin(Meta, Kind, _Fun, {Key, _}, E) ->
+  form_error(Meta, E, ?MODULE, {bad_or_missing_clauses, {Kind, Key}}).
+
+assert_at_most_once(_Kind, [], _Count, _Fun) -> ok;
+assert_at_most_once(Kind, [{Kind, _} | _], 1, ErrorFun) ->
+  ErrorFun(Kind);
+assert_at_most_once(Kind, [{Kind, _} | Rest], Count, Fun) ->
+  assert_at_most_once(Kind, Rest, Count + 1, Fun);
+assert_at_most_once(Kind, [_ | Rest], Count, Fun) ->
+  assert_at_most_once(Kind, Rest, Count, Fun).
+
+warn_catch_before_rescue([], _, _, _) ->
+  ok;
+warn_catch_before_rescue([{'rescue', _} | _], Meta, E, true) ->
+  form_warn(Meta, ?key(E, file), ?MODULE, {catch_before_rescue, origin(Meta, 'try')});
+warn_catch_before_rescue([{'catch', _} | Rest], Meta, E, _) ->
+  warn_catch_before_rescue(Rest, Meta, E, true);
+warn_catch_before_rescue([_ | Rest], Meta, E, Found) ->
+  warn_catch_before_rescue(Rest, Meta, E, Found).
+
+origin(Meta, Default) ->
+  case lists:keyfind(origin, 1, Meta) of
+    {origin, Origin} -> Origin;
+    false -> Default
+  end.
+
+format_error({bad_or_missing_clauses, {Kind, Key}}) ->
+  io_lib:format("expected -> clauses for :~ts in \"~ts\"", [Key, Kind]);
+format_error({bad_or_missing_clauses, Kind}) ->
+  io_lib:format("expected -> clauses in \"~ts\"", [Kind]);
+
+format_error({duplicated_clauses, Kind, Key}) ->
+  io_lib:format("duplicated :~ts clauses given for \"~ts\"", [Key, Kind]);
+
+format_error({unexpected_option, Kind, Option}) ->
+  io_lib:format("unexpected option ~ts in \"~ts\"", ['Elixir.Macro':to_string(Option), Kind]);
+
+format_error({wrong_number_of_args_for_clause, Expected, Kind, Key}) ->
+  io_lib:format("expected ~ts for :~ts clauses (->) in \"~ts\"", [Expected, Key, Kind]);
+
+format_error(multiple_after_clauses_in_receive) ->
+  "expected a single -> clause for :after in \"receive\"";
+
+format_error(invalid_rescue_clause) ->
+  "invalid \"rescue\" clause. The clause should match on an alias, a variable "
+    "or be in the \"var in [alias]\" format";
+
+format_error({catch_before_rescue, Origin}) ->
+  io_lib:format("\"catch\" should always come after \"rescue\" in ~ts", [Origin]);
+
+format_error({try_with_only_else_clause, Origin}) ->
+  io_lib:format("\"else\" shouldn't be used as the only clause in \"~ts\", use \"case\" instead",
+                [Origin]);
+
+format_error(unmatchable_else_in_with) ->
+  "\"else\" clauses will never match because all patterns in \"with\" will always match";
+
+format_error({zero_list_length_in_guard, ListArg}) ->
+  Arg = 'Elixir.Macro':to_string(ListArg),
+  io_lib:format("do not use \"length(~ts) == 0\" to check if a list is empty since length "
+                "always traverses the whole list. Prefer to pattern match on an empty list or "
+                "use \"~ts == []\" as a guard", [Arg, Arg]);
+
+format_error({positive_list_length_in_guard, ListArg}) ->
+  Arg = 'Elixir.Macro':to_string(ListArg),
+  io_lib:format("do not use \"length(~ts) > 0\" to check if a list is not empty since length "
+                "always traverses the whole list. Prefer to pattern match on a non-empty list, "
+                "such as [_ | _], or use \"~ts != []\" as a guard", [Arg, Arg]).

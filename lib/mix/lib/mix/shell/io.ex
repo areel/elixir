@@ -1,49 +1,83 @@
 defmodule Mix.Shell.IO do
   @moduledoc """
   This is Mix's default shell.
+
   It simply prints messages to stdio and stderr.
   """
 
   @behaviour Mix.Shell
 
   @doc """
+  Prints the current application to the shell if it
+  was not printed yet.
+  """
+  def print_app do
+    if name = Mix.Shell.printable_app_name() do
+      IO.puts("==> #{name}")
+    end
+
+    :ok
+  end
+
+  @doc """
+  Prints the given ANSI message to the shell followed by a newline.
+  """
+  def info(message) do
+    print_app()
+    IO.puts(IO.ANSI.format(message))
+  end
+
+  @doc """
+  Prints the given ANSI error to the shell followed by a newline.
+  """
+  def error(message) do
+    print_app()
+    IO.puts(:stderr, IO.ANSI.format(red(message)))
+  end
+
+  @doc """
+  Prints a message and prompts the user for input.
+
+  Input will be consumed until Enter is pressed.
+  """
+  def prompt(message) do
+    print_app()
+    IO.gets(message <> " ")
+  end
+
+  @doc """
+  Prints a message and asks the user if they want to proceed.
+
+  The user must press Enter or type one of "y", "yes", "Y", "YES"
+  or "Yes".
+
+  ## Examples
+
+      if Mix.shell().yes?("Are you sure?") do
+        # do something...
+      end
+
+  """
+  def yes?(message) do
+    print_app()
+    answer = IO.gets(message <> " [Yn] ")
+    is_binary(answer) and String.trim(answer) in ["", "y", "Y", "yes", "YES", "Yes"]
+  end
+
+  defp red(message) do
+    [:red, :bright, message]
+  end
+
+  @doc """
   Executes the given command and prints its output
   to stdout as it comes.
   """
-  def cmd(command) do
-    put_app
-    Mix.Shell.cmd(command, &IO.write(&1))
-  end
+  def cmd(command, opts \\ []) do
+    print_app? = Keyword.get(opts, :print_app, true)
 
-  @doc """
-  Writes a message to the shell followed by new line.
-  """
-  def info(message) do
-    put_app
-    IO.puts IO.ANSI.escape(message)
-  end
-
-  @doc """
-  Writes an error message to the shell followed by new line.
-  """
-  def error(message) do
-    put_app
-    IO.puts :stderr, IO.ANSI.escape "%{red,bright}#{message}"
-  end
-
-  @doc """
-  Receives a message and asks the user if he wants to proceed.
-  He must press enter or type anything that matches the a "yes"
-  regex `%r/^Y(es)?$/i`.
-  """
-  def yes?(message) do
-    put_app
-    IO.gets(message <> IO.ANSI.escape(" [Yn] ")) =~ %r/^(Y(es)?)?$/i
-  end
-
-  def put_app do
-    if Mix.Shell.output_app? do
-      IO.puts "==> #{Mix.project[:app]}"
-    end
+    Mix.Shell.cmd(command, opts, fn data ->
+      if print_app?, do: print_app()
+      IO.write(data)
+    end)
   end
 end

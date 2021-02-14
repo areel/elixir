@@ -1,233 +1,160 @@
 defmodule Set do
-  @moduledoc %S"""
-  This module specifies the Set API expected to be
-  implemented by different representations.
+  @moduledoc ~S"""
+  Generic API for sets.
 
-  It also provides functions that redirect to the
-  underlying Set, allowing a developer to work with
-  different Set implementations using one API.
-
-  To create a new set, use the `new` functions defined
-  by each set type:
-
-      HashSet.new  #=> creates an empty HashSet
-
-  For simplicity's sake, in the examples below every time
-  `new` is used, it implies one of the module-specific
-  calls like above.
+  This module is deprecated, use the `MapSet` module instead.
   """
 
-  use Behaviour
+  @moduledoc deprecated: "Use MapSet instead"
 
   @type value :: any
-  @type values :: [ value ]
-  @type t :: tuple
+  @type values :: [value]
+  @type t :: map
 
-  defcallback delete(t, value) :: t
-  defcallback difference(t, t) :: t
-  defcallback disjoint?(t, t) :: boolean
-  defcallback empty(t) :: t
-  defcallback equal?(t, t) :: boolean
-  defcallback intersection(t, t) :: t
-  defcallback member?(t, value) :: boolean
-  defcallback put(t, value) :: t
-  defcallback size(t) :: non_neg_integer
-  defcallback subset?(t, t) :: boolean
-  defcallback to_list(t) :: list()
-  defcallback union(t, t) :: t
+  message = "Use the MapSet module for working with sets"
 
   defmacrop target(set) do
     quote do
-      if is_tuple(unquote(set)) do
-        elem(unquote(set), 0)
-      else
-        unsupported_set(unquote(set))
+      case unquote(set) do
+        %module{} -> module
+        set -> unsupported_set(set)
       end
     end
   end
 
-  @doc """
-  Deletes `value` from `set`.
-
-  ## Examples
-
-      iex> s = HashSet.new([1, 2, 3])
-      ...> Set.delete(s, 4) |> HashSet.to_list
-      [1, 2, 3]
-
-      iex> s = HashSet.new([1, 2, 3])
-      ...> Set.delete(s, 2) |> HashSet.to_list
-      [1, 3]
-  """
-  @spec delete(t, value) :: t
+  @deprecated message
   def delete(set, value) do
     target(set).delete(set, value)
   end
 
-  @doc """
-  Returns a set that is `set1` without the members of `set2`.
-
-  ## Examples
-
-      iex> Set.difference(HashSet.new([1,2]), HashSet.new([2,3,4])) |> HashSet.to_list
-      [1]
-
-  """
-  @spec difference(t, t) :: t
+  @deprecated message
   def difference(set1, set2) do
-    target(set1).difference(set1, set2)
+    target1 = target(set1)
+    target2 = target(set2)
+
+    if target1 == target2 do
+      target1.difference(set1, set2)
+    else
+      Enumerable.reduce(set2, {:cont, set1}, fn v, acc ->
+        {:cont, target1.delete(acc, v)}
+      end)
+      |> elem(1)
+    end
   end
 
-  @doc """
-  Checks if `set1` and `set2` have no members in common.
-
-  ## Examples
-
-      iex> Set.disjoint?(HashSet.new([1, 2]), HashSet.new([3, 4]))
-      true
-      iex> Set.disjoint?(HashSet.new([1, 2]), HashSet.new([2, 3]))
-      false
-
-  """
-  @spec disjoint?(t, t) :: boolean
+  @deprecated message
   def disjoint?(set1, set2) do
-    target(set1).disjoint?(set1, set2)
+    target1 = target(set1)
+    target2 = target(set2)
+
+    if target1 == target2 do
+      target1.disjoint?(set1, set2)
+    else
+      Enumerable.reduce(set2, {:cont, true}, fn member, acc ->
+        case target1.member?(set1, member) do
+          false -> {:cont, acc}
+          _ -> {:halt, false}
+        end
+      end)
+      |> elem(1)
+    end
   end
 
-  @doc """
-  Returns an empty set of the same type as `set`.
-  """
-  @spec empty(t) :: t
+  @deprecated message
   def empty(set) do
     target(set).empty(set)
   end
 
-  @doc """
-  Checks if `set1` and `set2` are equal.
-
-  ## Examples
-
-      iex> Set.equal?(HashSet.new([1, 2]), HashSet.new([2, 1, 1]))
-      true
-      
-      iex> Set.equal?(HashSet.new([1, 2]), HashSet.new([3, 4]))
-      false
-
-  """
-  @spec equal?(t, t) :: boolean
+  @deprecated message
   def equal?(set1, set2) do
-    target(set1).equal?(set1, set2)
+    target1 = target(set1)
+    target2 = target(set2)
+
+    cond do
+      target1 == target2 ->
+        target1.equal?(set1, set2)
+
+      target1.size(set1) == target2.size(set2) ->
+        do_subset?(target1, target2, set1, set2)
+
+      true ->
+        false
+    end
   end
 
-  @doc """
-  Returns a set containing only members in common between `set1` and `set2`.
-
-  ## Examples
-
-      iex> Set.intersection(HashSet.new([1,2]), HashSet.new([2,3,4])) |> HashSet.to_list
-      [2]
-
-      iex> Set.intersection(HashSet.new([1,2]), HashSet.new([3,4])) |> HashSet.to_list  
-      []
-
-  """
-  @spec intersection(t, t) :: t
+  @deprecated message
   def intersection(set1, set2) do
-    target(set1).intersection(set1, set2)
+    target1 = target(set1)
+    target2 = target(set2)
+
+    if target1 == target2 do
+      target1.intersection(set1, set2)
+    else
+      Enumerable.reduce(set1, {:cont, target1.new}, fn v, acc ->
+        {:cont, if(target2.member?(set2, v), do: target1.put(acc, v), else: acc)}
+      end)
+      |> elem(1)
+    end
   end
 
-  @doc """
-  Checks if `set` contains `value`.
-
-  ## Examples
-
-      iex> Set.member?(HashSet.new([1, 2, 3]), 2)
-      true
-
-      iex> Set.member?(HashSet.new([1, 2, 3]), 4) 
-      false
-
-  """
-  @spec member?(t, value) :: boolean
+  @deprecated message
   def member?(set, value) do
     target(set).member?(set, value)
   end
 
-  @doc """
-  Inserts `value` into `set` if it does not already contain it.
-
-  ## Examples
-
-      iex> Set.put(HashSet.new([1, 2, 3]), 3) |> Set.to_list
-      [1, 2, 3]
-
-      iex> Set.put(HashSet.new([1, 2, 3]), 4) |> Set.to_list
-      [1, 2, 3, 4]
-
-  """
-  @spec put(t, value) :: t
+  @deprecated message
   def put(set, value) do
     target(set).put(set, value)
   end
 
-  @doc """
-  Returns the number of elements in `set`.
-
-  ## Examples
-
-      iex> Set.size(HashSet.new([1, 2, 3]))
-      3
-
-  """
-  @spec size(t) :: non_neg_integer
+  @deprecated message
   def size(set) do
     target(set).size(set)
   end
 
-  @doc """
-  Checks if `set1`'s members are all contained in `set2`.
-
-  ## Examples
-
-      iex> Set.subset?(HashSet.new([1, 2]), HashSet.new([1, 2, 3]))
-      true
-      iex> Set.subset?(HashSet.new([1, 2, 3]), HashSet.new([1, 2]))
-      false
-  """
-  @spec subset?(t, t) :: boolean
+  @deprecated message
   def subset?(set1, set2) do
-    target(set1).subset?(set1, set2)
+    target1 = target(set1)
+    target2 = target(set2)
+
+    if target1 == target2 do
+      target1.subset?(set1, set2)
+    else
+      do_subset?(target1, target2, set1, set2)
+    end
   end
 
-  @doc """
-  Converts `set` to a list.
-
-  ## Examples
-
-      iex> HashSet.to_list(HashSet.new([1, 2, 3]))
-      [1,2,3]
-
-  """
-  @spec to_list(t) :: list
+  @deprecated message
   def to_list(set) do
     target(set).to_list(set)
   end
 
-  @doc """
-  Returns a set containing all members of `set1` and `set2`.
-
-  ## Examples
-
-      iex> Set.union(HashSet.new([1,2]), HashSet.new([2,3,4])) |> HashSet.to_list
-      [1,2,3,4]
-
-  """
-  @spec union(t, t) :: t
+  @deprecated message
   def union(set1, set2) do
-    target(set1).union(set1, set2)
+    target1 = target(set1)
+    target2 = target(set2)
+
+    if target1 == target2 do
+      target1.union(set1, set2)
+    else
+      Enumerable.reduce(set2, {:cont, set1}, fn v, acc ->
+        {:cont, target1.put(acc, v)}
+      end)
+      |> elem(1)
+    end
+  end
+
+  defp do_subset?(_target1, target2, set1, set2) do
+    Enumerable.reduce(set1, {:cont, true}, fn member, acc ->
+      case target2.member?(set2, member) do
+        true -> {:cont, acc}
+        _ -> {:halt, false}
+      end
+    end)
+    |> elem(1)
   end
 
   defp unsupported_set(set) do
-    raise ArgumentError, message: "unsupported set: #{inspect set}"
+    raise ArgumentError, "unsupported set: #{inspect(set)}"
   end
 end

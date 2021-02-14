@@ -1,12 +1,7 @@
-defmodule Umbrella.Mixfile do
+defmodule Umbrella.MixProject do
   use Mix.Project
 
   def project do
-    [ apps_path: "apps",
-      deps: deps ]
-  end
-
-  defp deps do
-    [ { :some_dep, path: "deps/some_dep" } ]
+    [apps_path: "apps"]
   end
 end

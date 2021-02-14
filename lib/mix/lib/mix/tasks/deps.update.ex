@@ -1,90 +1,74 @@
 defmodule Mix.Tasks.Deps.Update do
   use Mix.Task
 
-  @shortdoc "Update the given dependencies"
-  @recursive :both
+  @shortdoc "Updates the given dependencies"
 
   @moduledoc """
-  Update the given dependencies.
+  Updates the given dependencies.
 
-  Since this is a destructive action, update of all dependencies
-  can only happen by passing the `--all` command line option.
+  The given dependencies and the projects they depend on will
+  be unlocked and updated to the latest version according to their
+  version requirements.
+
+  Since this is a destructive action, updating all dependencies
+  only occurs when the `--all` command line option is passed.
 
   All dependencies are automatically recompiled after update.
 
+  ## mix deps.unlock + mix deps.get
+
+  Upgrading a dependency often requires the projects it depends on
+  to upgrade too. If you would rather update a single dependency and
+  not touch its children, you can explicitly unlock the single dependency
+  and run `mix deps.get`:
+
+      $ mix deps.unlock some_dep
+      $ mix deps.get
+
   ## Command line options
 
-  * `--all` - update all dependencies
-  * `--no-compile` - skip compilation of dependencies
-  * `--no-deps-check` - skip dependency check
-  * `--quiet` - do not output verbose messages
+    * `--all` - updates all dependencies
+    * `--only` - only fetches dependencies for given environment
+    * `--target` - only fetches dependencies for given target
+    * `--no-archives-check` - does not check archives before fetching deps
 
   """
 
-  import Mix.Deps, only: [ all: 0, all: 2, available?: 1, by_name: 2,
-                           with_depending: 2, format_dep: 1 ]
-
+  @impl true
   def run(args) do
-    Mix.Project.get! # Require the project to be available
-    { opts, rest, _ } = OptionParser.parse(args, switches: [no_compile: :boolean, all: :boolean])
+    unless "--no-archives-check" in args do
+      Mix.Task.run("archive.check", args)
+    end
+
+    Mix.Project.get!()
+
+    {opts, rest, _} =
+      OptionParser.parse(args, switches: [all: :boolean, only: :string, target: :string])
+
+    fetch_opts =
+      for {switch, key} <- [only: :env, target: :target],
+          value = opts[switch],
+          do: {key, :"#{value}"}
 
     cond do
       opts[:all] ->
-        acc = all(init, &deps_updater/2)
+        Mix.Dep.Fetcher.all(Mix.Dep.Lock.read(), %{}, fetch_opts)
+
       rest != [] ->
-        all_deps = all
-        deps = by_name(rest, all_deps)
-          |> Enum.map(&check_unavailable!/1)
-          |> with_depending(all_deps)
-        { _, acc } = Enum.map_reduce(deps, init, &deps_updater/2)
+        {old, new} = Map.split(Mix.Dep.Lock.read(), to_app_names(rest))
+        Mix.Dep.Fetcher.by_name(rest, old, new, fetch_opts)
+
       true ->
-        raise Mix.Error, message: "mix deps.update expects dependencies as arguments or " <>
-                                  "the --all option to update all dependencies"
-    end
-
-    finalize_update(acc, opts)
-  end
-
-  defp init do
-    { [], Mix.Deps.Lock.read }
-  end
-
-  defp finalize_update({ apps, lock }, opts) do
-    Mix.Deps.Lock.write(lock)
-    unless opts[:no_compile] do
-      case opts[:quiet] do
-        true ->
-          Mix.Task.run("deps.compile", ["--quiet"|apps])
-        _ ->
-          Mix.Task.run("deps.compile", apps)
-      end
-      unless opts[:no_deps_check], do: Mix.Task.run("deps.check", [])
+        Mix.raise(
+          "\"mix deps.update\" expects dependencies as arguments or " <>
+            "the --all option to update all dependencies"
+        )
     end
   end
 
-  defp deps_updater(dep, { acc, lock }) do
-    if available?(dep) do
-      Mix.Dep[app: app, scm: scm, opts: opts] = dep
-      Mix.shell.info "* Updating #{format_dep(dep)}"
-
-      lock =
-        if latest = scm.update(opts) do
-          Keyword.put(lock, app, latest)
-        else
-          lock
-        end
-
-      { Mix.Deps.update(dep), { [app|acc], lock } }
-    else
-      { dep, { acc, lock } }
-    end
-  end
-
-  defp check_unavailable!(dep) do
-    unless available?(dep) do
-      raise Mix.Error, message: "Cannot update dependency #{dep.app} because " <>
-        "it isn't available, run `mix deps.get` first"
-    end
-    dep
+  defp to_app_names(given) do
+    Enum.map(given, fn app ->
+      if is_binary(app), do: String.to_atom(app), else: app
+    end)
   end
 end

@@ -1,21 +1,25 @@
-defmodule IEx.Mixfile do
+defmodule IEx.MixProject do
   use Mix.Project
 
   def project do
-    [app: :iex, version: System.version]
+    [
+      app: :iex,
+      version: System.version(),
+      build_per_environment: false
+    ]
   end
 
   def application do
-    [ env: [
-        after_spawn: [],
-        inspect_opts: [limit: 50, raw: false, pretty: true],
-        colors: [ enabled: true,
-                  eval_result: "yellow",
-                  error: "red",
-                  info: "normal",
-                  directory: "blue",
-                  device: "green" ],
+    [
+      registered: [IEx.Broker, IEx.Config, IEx.Pry, IEx.Supervisor],
+      mod: {IEx.App, []},
+      env: [
+        colors: [],
+        inspect: [pretty: true],
         history_size: 20,
-        started: true ] ]
+        default_prompt: "%prefix(%counter)>",
+        alive_prompt: "%prefix(%node)%counter>"
+      ]
+    ]
   end
 end

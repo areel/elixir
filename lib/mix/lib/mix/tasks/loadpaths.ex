@@ -1,48 +1,85 @@
 defmodule Mix.Tasks.Loadpaths do
   use Mix.Task
 
-  @hidden true
-  @shortdoc "Load the application and its dependencies paths"
-  @recursive true
-
   @moduledoc """
-  Load the application and its dependencies paths.
+  Loads the application and its dependencies paths.
+
+  This task is never directly invoked from the command line,
+  but it is rather used as building block by other tasks.
 
   ## Configuration
 
-  * `:load_paths` extra load paths to be added.
-    They are added with lower priority than the app ones.
+    * `:elixir` - matches the current Elixir version against the
+      given requirement
 
   ## Command line options
 
-  * `--no-deps` - do not load dependencies
-  * `--no-deps-check` - do not check dependencies
-  * `--no-elixir-version-check` - do not check elixir version
+    * `--no-archives-check` - does not check archive
+    * `--no-deps-check` - does not check dependencies
+    * `--no-elixir-version-check` - does not check Elixir version
 
   """
+  @impl true
   def run(args) do
-    { opts, _, _ } = OptionParser.parse(args)
+    config = Mix.Project.config()
 
-    unless opts[:no_deps] do
-      Mix.Task.run "deps.loadpaths", args
+    unless "--no-elixir-version-check" in args do
+      check_elixir_version(config, args)
     end
 
-    unless opts[:no_elixir_version_check] do
-      config = Mix.project
+    unless "--no-archives-check" in args do
+      Mix.Task.run("archive.check", args)
+    end
 
-      if requirement = config[:elixir] do
-        unless Version.match?(System.version, requirement) do
-          raise Mix.ElixirVersionError, target: config[:app] || Mix.Project.get,
-                                        expected: requirement,
-                                        actual: System.version
-        end
+    # --no-deps-loading is used only internally. It has no
+    # purpose from Mix.CLI because running a task may load deps.
+    unless "--no-deps-loading" in args do
+      Mix.Task.run("deps.loadpaths", args)
+    end
+
+    if config[:app] do
+      load_project(config, args)
+    end
+
+    :ok
+  end
+
+  defp check_elixir_version(config, _) do
+    if req = config[:elixir] do
+      case Version.parse_requirement(req) do
+        {:ok, req} ->
+          unless Version.match?(System.version(), req) do
+            raise Mix.ElixirVersionError,
+              target: config[:app] || Mix.Project.get(),
+              expected: req,
+              actual: System.version()
+          end
+
+        :error ->
+          Mix.raise("Invalid Elixir version requirement #{req} in mix.exs file")
       end
     end
+  end
 
-    # Force recompile if we have a version mismatch
-    old_vsn = Mix.Deps.Lock.elixir_vsn
-    if old_vsn && old_vsn != System.version, do: Mix.Deps.Lock.touch
+  defp load_project(config, _args) do
+    vsn = {System.version(), :erlang.system_info(:otp_release)}
+    scm = config[:build_scm]
 
-    Enum.each Mix.Project.load_paths, &Code.prepend_path(&1)
+    # Erase the app build if we have lock mismatch.
+    # We do this to force full recompilation when
+    # any of SCM or Elixir version changes. Applies
+    # to dependencies and the main project alike.
+    case Mix.Dep.ElixirSCM.read() do
+      {:ok, old_vsn, _} when old_vsn != vsn -> rm_rf_app(config)
+      {:ok, _, old_scm} when old_scm != scm -> rm_rf_app(config)
+      _ -> :ok
+    end
+
+    Code.prepend_path(Mix.Project.compile_path(config))
+  end
+
+  defp rm_rf_app(config) do
+    File.rm_rf(Mix.Project.app_path(config))
+    File.rm_rf(Mix.Project.consolidation_path(config))
   end
 end

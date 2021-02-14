@@ -1,81 +1,62 @@
 import Kernel, except: [to_string: 1]
 
 defprotocol String.Chars do
-  @moduledoc %S"""
-  The String.Chars protocol is responsible for
-  converting a structure to a Binary (only if applicable).
-  The only function required to be implemented is
-  `to_string` which does the conversion.
+  @moduledoc ~S"""
+  The `String.Chars` protocol is responsible for
+  converting a structure to a binary (only if applicable).
 
-  The `to_string` function automatically imported
-  by Kernel invokes this protocol. String
-  interpolation also invokes to_string in its
+  The only function required to be implemented is
+  `to_string/1`, which does the conversion.
+
+  The `to_string/1` function automatically imported
+  by `Kernel` invokes this protocol. String
+  interpolation also invokes `to_string/1` in its
   arguments. For example, `"foo#{bar}"` is the same
   as `"foo" <> to_string(bar)`.
   """
 
-  @only [BitString, List, Number, Atom, Record]
-
-  def to_string(thing)
+  @doc """
+  Converts `term` to a string.
+  """
+  @spec to_string(t) :: String.t()
+  def to_string(term)
 end
 
 defimpl String.Chars, for: Atom do
-  @doc """
-  Convert the atom literally to a binary, except
-  `nil` which is converted to an empty string.
-  """
   def to_string(nil) do
     ""
   end
 
   def to_string(atom) do
-    atom_to_binary(atom, :utf8)
+    Atom.to_string(atom)
   end
 end
 
 defimpl String.Chars, for: BitString do
-  @doc """
-  Returns the given binary or raises an error for bitstrings.
-  """
-  def to_string(thing) when is_binary(thing) do
-    thing
+  def to_string(term) when is_binary(term) do
+    term
   end
 
-  def to_string(thing) do
+  def to_string(term) do
     raise Protocol.UndefinedError,
-             protocol: @protocol,
-                value: thing,
-          description: "cannot convert a bitstring to a string"
+      protocol: @protocol,
+      value: term,
+      description: "cannot convert a bitstring to a string"
   end
 end
 
 defimpl String.Chars, for: List do
-  @doc """
-  Consider the list is an iolist and converts it
-  to a binary. This allows a list of binaries, or
-  a charlist, or a mix of both, to be converted
-  successfully.
-
-  ## Examples
-
-      iex> to_string('foo')
-      "foo"
-      iex> to_string(["foo", 'bar'])
-      "foobar"
-
-  """
-  def to_string(char_list), do: String.from_char_list!(char_list)
+  def to_string(charlist), do: List.to_string(charlist)
 end
 
-defimpl String.Chars, for: Number do
-  @doc """
-  Simply converts the number (integer or a float) to a binary.
-  """
-  def to_string(thing) when is_integer(thing) do
-    integer_to_binary(thing)
+defimpl String.Chars, for: Integer do
+  def to_string(term) do
+    Integer.to_string(term)
   end
+end
 
-  def to_string(thing) do
-    iolist_to_binary(:io_lib_format.fwrite_g(thing))
+defimpl String.Chars, for: Float do
+  def to_string(term) do
+    IO.iodata_to_binary(:io_lib_format.fwrite_g(term))
   end
 end

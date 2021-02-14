@@ -1,6 +1,7 @@
 -module(b).
--compile(export_all).
+-export([b/0]).
 
--record(br, { cell=undefined }).
+-callback c() -> term().
+-record(br, {cell=undefined}).
 
-b() -> #br{ cell=specified }.
+b() -> #br{cell=specified}.

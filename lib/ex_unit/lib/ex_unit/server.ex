@@ -1,69 +1,99 @@
 defmodule ExUnit.Server do
   @moduledoc false
+  @name __MODULE__
+  @timeout :infinity
 
-  @timeout 30_000
-  use GenServer.Behaviour
+  use GenServer
 
-  defrecord Config, async_cases: [], sync_cases: [], start_load: nil
-
-  def start_link() do
-    :gen_server.start_link({ :local, __MODULE__ }, __MODULE__, :ok, [])
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: @name)
   end
 
-  ## Before run API
+  def add_async_module(name), do: add(name, :async)
+  def add_sync_module(name), do: add(name, :sync)
 
-  def start_load() do
-    :gen_server.cast(__MODULE__, :start_load)
+  defp add(name, type) do
+    case GenServer.call(@name, {:add, name, type}, @timeout) do
+      :ok ->
+        :ok
+
+      :already_running ->
+        raise "cannot add #{type} case named #{inspect(name)} to test suite after the suite starts running"
+    end
   end
 
-  def add_async_case(name) do
-    :gen_server.cast(__MODULE__, { :add_async_case, name })
+  def modules_loaded do
+    GenServer.call(@name, :modules_loaded, @timeout)
   end
 
-  def add_sync_case(name) do
-    :gen_server.cast(__MODULE__, { :add_sync_case, name })
+  def take_async_modules(count) do
+    GenServer.call(@name, {:take_async_modules, count}, @timeout)
   end
 
-  ## After run API
-
-  def start_run() do
-    :gen_server.call(__MODULE__, :start_run, @timeout)
+  def take_sync_modules() do
+    GenServer.call(@name, :take_sync_modules, @timeout)
   end
 
   ## Callbacks
 
   def init(:ok) do
-    { :ok, Config[] }
+    state = %{
+      loaded: System.monotonic_time(),
+      waiting: nil,
+      async_modules: [],
+      sync_modules: []
+    }
+
+    {:ok, state}
   end
 
-  def handle_call(:start_run, _from, config) do
-    load_us =
-      if start_load = config.start_load do
-        :timer.now_diff(:os.timestamp, start_load)
-      end
-
-    { :reply,
-      { config.async_cases, config.sync_cases, load_us },
-      config.async_cases([]).sync_cases([]).start_load(nil) }
+  # Called on demand until we are signaled all modules are loaded.
+  def handle_call({:take_async_modules, count}, from, %{waiting: nil} = state) do
+    {:noreply, take_modules(%{state | waiting: {from, count}})}
   end
 
-  def handle_call(request, from, config) do
-    super(request, from, config)
+  # Called once after all async modules have been sent and reverts the state.
+  def handle_call(:take_sync_modules, _from, state) do
+    %{waiting: nil, loaded: :done, async_modules: []} = state
+    {:reply, state.sync_modules, %{state | sync_modules: [], loaded: System.monotonic_time()}}
   end
 
-  def handle_cast(:start_load, config) do
-    { :noreply, config.start_load(:os.timestamp) }
+  def handle_call(:modules_loaded, _from, %{loaded: loaded} = state) when is_integer(loaded) do
+    diff = System.convert_time_unit(System.monotonic_time() - loaded, :native, :microsecond)
+    {:reply, diff, take_modules(%{state | loaded: :done})}
   end
 
-  def handle_cast({:add_async_case, name}, config) do
-    { :noreply, config.update_async_cases &[name|&1] }
+  def handle_call({:add, name, :async}, _from, %{loaded: loaded} = state)
+      when is_integer(loaded) do
+    state = update_in(state.async_modules, &[name | &1])
+    {:reply, :ok, take_modules(state)}
   end
 
-  def handle_cast({:add_sync_case, name}, config) do
-    { :noreply, config.update_sync_cases &[name|&1] }
+  def handle_call({:add, name, :sync}, _from, %{loaded: loaded} = state)
+      when is_integer(loaded) do
+    state = update_in(state.sync_modules, &[name | &1])
+    {:reply, :ok, state}
   end
 
-  def handle_cast(request, config) do
-    super(request, config)
+  def handle_call({:add, _name, _type}, _from, state),
+    do: {:reply, :already_running, state}
+
+  defp take_modules(%{waiting: nil} = state) do
+    state
+  end
+
+  defp take_modules(%{waiting: {from, _count}, async_modules: [], loaded: :done} = state) do
+    GenServer.reply(from, nil)
+    %{state | waiting: nil}
+  end
+
+  defp take_modules(%{async_modules: []} = state) do
+    state
+  end
+
+  defp take_modules(%{waiting: {from, count}, async_modules: modules} = state) do
+    {reply, modules} = Enum.split(modules, count)
+    GenServer.reply(from, reply)
+    %{state | async_modules: modules, waiting: nil}
   end
 end

@@ -2,32 +2,34 @@
 %% This module access the information stored on the scope
 %% by elixir_import and therefore assumes it is normalized (ordsets)
 -module(elixir_dispatch).
--export([default_macros/0, default_functions/0, default_requires/0,
-  dispatch_require/6, dispatch_import/5,
+-export([dispatch_import/5, dispatch_require/6,
   require_function/5, import_function/4,
-  expand_import/6, expand_require/6, find_import/4,
-  format_error/1, in_erlang_functions/0, in_erlang_macros/0]).
+  expand_import/6, expand_require/5,
+  default_functions/0, default_macros/0, default_requires/0,
+  find_import/4, format_error/1]).
 -include("elixir.hrl").
-
 -import(ordsets, [is_element/2]).
--define(builtin, 'Elixir.Kernel').
+-define(kernel, 'Elixir.Kernel').
 
 default_functions() ->
-  [ { ?builtin, elixir_imported_functions() } ].
+  [{?kernel, elixir_imported_functions()}].
 default_macros() ->
-  [ { ?builtin, elixir_imported_macros() } ].
+  [{?kernel, elixir_imported_macros()}].
 default_requires() ->
-  [ 'Elixir.Integer', 'Elixir.Kernel', 'Elixir.Kernel.Typespec', 'Elixir.Record' ].
+  ['Elixir.Application', 'Elixir.Kernel', 'Elixir.Kernel.Typespec'].
 
-find_import(Meta, Name, Arity, S) ->
-  Tuple = { Name, Arity },
+%% This is used by elixir_quote. Note we don't record the
+%% import locally because at that point there is no
+%% ambiguity.
+find_import(Meta, Name, Arity, E) ->
+  Tuple = {Name, Arity},
 
-  case find_dispatch(Meta, Tuple, S) of
-    { function, Receiver } ->
-      elixir_tracker:record_import(Tuple, Receiver, S#elixir_scope.module, S#elixir_scope.function),
+  case find_dispatch(Meta, Tuple, [], E) of
+    {function, Receiver} ->
+      elixir_env:trace({imported_function, Meta, Receiver, Name, Arity}, E),
       Receiver;
-    { macro, Receiver } ->
-      elixir_tracker:record_import(Tuple, Receiver, S#elixir_scope.module, S#elixir_scope.function),
+    {macro, Receiver} ->
+      elixir_env:trace({imported_macro, Meta, Receiver, Name, Arity}, E),
       Receiver;
     _ ->
       false
@@ -35,481 +37,348 @@ find_import(Meta, Name, Arity, S) ->
 
 %% Function retrieval
 
-import_function(Meta, Name, Arity, S) ->
-  Tuple = { Name, Arity },
-  case find_dispatch(Meta, Tuple, S) of
-    { function, Receiver } ->
-      elixir_tracker:record_import(Tuple, Receiver, S#elixir_scope.module, S#elixir_scope.function),
-      remote_function(Meta, Receiver, Name, Arity, S);
-    { macro, _Receiver } ->
+import_function(Meta, Name, Arity, E) ->
+  Tuple = {Name, Arity},
+  case find_dispatch(Meta, Tuple, [], E) of
+    {function, Receiver} ->
+      elixir_env:trace({imported_function, Meta, Receiver, Name, Arity}, E),
+      elixir_locals:record_import(Tuple, Receiver, ?key(E, module), ?key(E, function)),
+      remote_function(Meta, Receiver, Name, Arity, E);
+    {macro, _Receiver} ->
       false;
-    { import, Receiver } ->
-      require_function(Meta, Receiver, Name, Arity, S);
+    {import, Receiver} ->
+      require_function(Meta, Receiver, Name, Arity, E);
     false ->
       case elixir_import:special_form(Name, Arity) of
-        true  -> false;
+        true ->
+          false;
         false ->
-          elixir_tracker:record_local(Tuple, S#elixir_scope.module, S#elixir_scope.function),
-          { { 'fun', ?line(Meta), { function, Name, Arity } }, S }
+          Function = ?key(E, function),
+
+          case (Function /= nil) andalso (Function /= Tuple) andalso
+                elixir_def:local_for(?key(E, module), Name, Arity, [defmacro, defmacrop]) of
+            false ->
+              elixir_env:trace({local_function, Meta, Name, Arity}, E),
+              elixir_locals:record_local(Tuple, ?key(E, module), ?key(E, function), Meta, false),
+              {local, Name, Arity};
+            _ ->
+              false
+          end
       end
   end.
 
-require_function(Meta, Receiver, Name, Arity, S) ->
-  Tuple = { Name, Arity },
-
-  case is_element(Tuple, get_optional_macros(Receiver)) of
+require_function(Meta, Receiver, Name, Arity, E) ->
+  Required = is_element(Receiver, ?key(E, requires)),
+  case is_element({Name, Arity}, get_macros(Receiver, Required)) of
     true  -> false;
     false ->
-      elixir_tracker:record_remote(Tuple, Receiver, S#elixir_scope.module, S#elixir_scope.function),
-      remote_function(Meta, Receiver, Name, Arity, S)
+      elixir_env:trace({remote_function, Meta, Receiver, Name, Arity}, E),
+      remote_function(Meta, Receiver, Name, Arity, E)
   end.
 
-%% Function dispatch
+remote_function(Meta, Receiver, Name, Arity, E) ->
+  check_deprecated(Meta, Receiver, Name, Arity, E),
 
-dispatch_import(Meta, Name, Args, S, Callback) ->
-  Module = S#elixir_scope.module,
-  Arity  = length(Args),
-  Tuple  = { Name, Arity },
-
-  case find_dispatch(Meta, Tuple, S) of
-    { function, Receiver } ->
-      elixir_tracker:record_import(Tuple, Receiver, Module, S#elixir_scope.function),
-      Endpoint = case (Receiver == ?builtin) andalso is_element(Tuple, in_erlang_functions()) of
-        true  -> erlang;
-        false -> Receiver
-      end,
-      elixir_translator:translate_each({ { '.', Meta, [Endpoint, Name] }, Meta, Args }, S);
-    { import, Receiver } ->
-      elixir_tracker:record_remote(Tuple, Receiver, S#elixir_scope.module, S#elixir_scope.function),
-      elixir_translator:translate_each({ { '.', Meta, [Receiver, Name] }, [{require,false}|Meta], Args }, S);
-    Result ->
-      case do_expand_import(Meta, Tuple, Args, Module, S, Result) of
-        { error, noexpansion } ->
-          Callback();
-        { error, internal } ->
-          elixir_tracker:record_import(Tuple, ?builtin, Module, S#elixir_scope.function),
-          elixir_macros:translate({ Name, Meta, Args }, S);
-        { ok, _Receiver, Tree } ->
-          translate_expansion(Meta, Tree, S)
-      end
+  case elixir_rewrite:inline(Receiver, Name, Arity) of
+    {AR, AN} -> {remote, AR, AN, Arity};
+    false    -> {remote, Receiver, Name, Arity}
   end.
 
-dispatch_require(Meta, Receiver, Name, Args, S, Callback) ->
-  Module = S#elixir_scope.module,
-  Arity  = length(Args),
-  Tuple  = { Name, Arity },
+%% Dispatches
 
-  case (Receiver == ?builtin) andalso is_element(Tuple, in_erlang_functions()) of
-    true ->
-      elixir_tracker:record_remote(Tuple, Receiver, S#elixir_scope.module, S#elixir_scope.function),
-      { TArgs, SA } = elixir_translator:translate_args(Args, S),
-      { ?wrap_call(?line(Meta), erlang, Name, TArgs), SA };
+dispatch_import(Meta, Name, Args, E, Callback) ->
+  Arity = length(Args),
+  case expand_import(Meta, {Name, Arity}, Args, E, [], false) of
+    {ok, Receiver, Quoted} ->
+      expand_quoted(Meta, Receiver, Name, Arity, Quoted, E);
+    {ok, Receiver, NewName, NewArgs} ->
+      elixir_expand:expand({{'.', Meta, [Receiver, NewName]}, Meta, NewArgs}, E);
+    error ->
+      Callback()
+  end.
+
+%% TODO: Remove this rewrite when we require Erlang/OTP 23+
+dispatch_require(_Meta, 'Elixir.System', stacktrace, [], #{contextual_vars := Vars} = E, Callback) ->
+  case lists:member('__STACKTRACE__', Vars) of
+    true -> {{'__STACKTRACE__', [], nil}, E};
+    false -> Callback('Elixir.System', stacktrace, [])
+  end;
+
+dispatch_require(Meta, Receiver, Name, Args, E, Callback) when is_atom(Receiver) ->
+  Arity = length(Args),
+
+  case elixir_rewrite:inline(Receiver, Name, Arity) of
+    {AR, AN} ->
+      Callback(AR, AN, Args);
     false ->
-      case expand_require(Meta, Receiver, Tuple, Args, Module, S) of
-        { error, noexpansion } ->
-          Callback();
-        { error, internal } ->
-          elixir_tracker:record_remote(Tuple, ?builtin, S#elixir_scope.module, S#elixir_scope.function),
-          elixir_macros:translate({ Name, Meta, Args }, S);
-        { ok, _Receiver, Tree } ->
-          translate_expansion(Meta, Tree, S)
-      end
-  end.
-
-%% Macros expansion
-
-expand_import(Meta, Tuple, Args, Module, Extra, S) ->
-  Result = find_dispatch(Meta, Tuple, Extra, S),
-  do_expand_import(Meta, Tuple, Args, Module, S, Result).
-
-do_expand_import(Meta, { Name, Arity } = Tuple, Args, Module, S, Result) ->
-  Function = S#elixir_scope.function,
-
-  Fun = (Function /= nil) andalso (Function /= Tuple) andalso
-        elixir_def_local:macro_for(Tuple, true, S),
-
-  case Fun of
-    false ->
-      do_expand_import_no_local(Meta, Tuple, Args, Module, S, Result);
-    _ ->
-      case Result of
-        { Kind, Receiver } when Kind == import; Receiver == Module ->
-          do_expand_import_no_local(Meta, Tuple, Args, Module, S, Result);
-        { _, Receiver } ->
-          Error = { macro_conflict, { Receiver, Name, Arity } },
-          elixir_errors:form_error(Meta, S#elixir_scope.file, ?MODULE, Error);
-        false ->
-          elixir_tracker:record_local(Tuple, Module, S#elixir_scope.function),
-          { ok, Module, expand_macro_fun(Meta, Fun(), Module, Name, Args, Module, S) }
-      end
-  end.
-
-do_expand_import_no_local(Meta, { Name, Arity } = Tuple, Args, Module, S, Result) ->
-  case Result of
-    { macro, ?builtin } ->
-      case is_element(Tuple, in_erlang_macros()) of
-        true  -> { error, internal };
-        false ->
-          elixir_tracker:record_import(Tuple, ?builtin, Module, S#elixir_scope.function),
-          { ok, ?builtin, expand_macro_named(Meta, ?builtin, Name, Arity, Args, Module, S) }
-      end;
-    { macro, Receiver } ->
-      elixir_tracker:record_import(Tuple, Receiver, Module, S#elixir_scope.function),
-      { ok, Receiver, expand_macro_named(Meta, Receiver, Name, Arity, Args, Module, S) };
-    { import, Receiver } ->
-      expand_require(Meta, Receiver, Tuple, Args, Module, S);
-    _ ->
-      { error, noexpansion }
-  end.
-
-expand_require(Meta, ?builtin, { Name, Arity } = Tuple, Args, Module, S) ->
-  case is_element(Tuple, in_erlang_macros()) of
-    true  -> { error, internal };
-    false ->
-      case is_element(Tuple, in_elixir_macros()) of
-        true  ->
-          elixir_tracker:record_remote(Tuple, ?builtin, S#elixir_scope.module, S#elixir_scope.function),
-          { ok, ?builtin, expand_macro_named(Meta, ?builtin, Name, Arity, Args, Module, S) };
-        false ->
-          { error, noexpansion }
+      case expand_require(Meta, Receiver, {Name, Arity}, Args, E) of
+        {ok, Receiver, Quoted} -> expand_quoted(Meta, Receiver, Name, Arity, Quoted, E);
+        error -> Callback(Receiver, Name, Args)
       end
   end;
 
-expand_require(Meta, Receiver, { Name, Arity } = Tuple, Args, Module, S) ->
-  Function = S#elixir_scope.function,
+dispatch_require(_Meta, Receiver, Name, Args, _E, Callback) ->
+  Callback(Receiver, Name, Args).
 
-  Fun = (Module == Receiver) andalso (Function /= nil) andalso
-        (Function /= Tuple) andalso elixir_def_local:macro_for(Tuple, false, S),
+%% Macros expansion
 
-  case Fun of
-    false ->
-      case is_element(Tuple, get_optional_macros(Receiver)) of
-        true  ->
-          elixir_tracker:record_remote(Tuple, Receiver, Module, Function),
-          { ok, Receiver, expand_macro_named(Meta, Receiver, Name, Arity, Args, Module, S) };
-        false -> { error, noexpansion }
-      end;
+expand_import(Meta, {Name, Arity} = Tuple, Args, E, Extra, External) ->
+  Module = ?key(E, module),
+  Function = ?key(E, function),
+  Dispatch = find_dispatch(Meta, Tuple, Extra, E),
+
+  case Dispatch of
+    {import, _} ->
+      do_expand_import(Meta, Tuple, Args, Module, E, Dispatch);
     _ ->
-      elixir_tracker:record_local(Tuple, Module, Function),
-      { ok, Receiver, expand_macro_fun(Meta, Fun(), Receiver, Name, Args, Module, S) }
+      AllowLocals = External orelse ((Function /= nil) andalso (Function /= Tuple)),
+      Local = AllowLocals andalso
+                elixir_def:local_for(Module, Name, Arity, [defmacro, defmacrop]),
+
+      case Dispatch of
+        %% There is a local and an import. This is a conflict unless
+        %% the receiver is the same as module (happens on bootstrap).
+        {_, Receiver} when Local /= false, Receiver /= Module ->
+          Error = {macro_conflict, {Receiver, Name, Arity}},
+          elixir_errors:form_error(Meta, E, ?MODULE, Error);
+
+        %% There is no local. Dispatch the import.
+        _ when Local == false ->
+          do_expand_import(Meta, Tuple, Args, Module, E, Dispatch);
+
+        %% Dispatch to the local.
+        _ ->
+          elixir_env:trace({local_macro, Meta, Name, Arity}, E),
+          elixir_locals:record_local(Tuple, Module, Function, Meta, true),
+          {ok, Module, expand_macro_fun(Meta, Local, Module, Name, Args, E)}
+      end
+  end.
+
+do_expand_import(Meta, {Name, Arity} = Tuple, Args, Module, E, Result) ->
+  case Result of
+    {function, Receiver} ->
+      elixir_env:trace({imported_function, Meta, Receiver, Name, Arity}, E),
+      elixir_locals:record_import(Tuple, Receiver, Module, ?key(E, function)),
+      {ok, Receiver, Name, Args};
+    {macro, Receiver} ->
+      check_deprecated(Meta, Receiver, Name, Arity, E),
+      elixir_env:trace({imported_macro, Meta, Receiver, Name, Arity}, E),
+      elixir_locals:record_import(Tuple, Receiver, Module, ?key(E, function)),
+      {ok, Receiver, expand_macro_named(Meta, Receiver, Name, Arity, Args, E)};
+    {import, Receiver} ->
+      case expand_require([{required, true} | Meta], Receiver, Tuple, Args, E) of
+        {ok, _, _} = Response -> Response;
+        error -> {ok, Receiver, Name, Args}
+      end;
+    false when Module == ?kernel ->
+      case elixir_rewrite:inline(Module, Name, Arity) of
+        {AR, AN} -> {ok, AR, AN, Args};
+        false -> error
+      end;
+    false ->
+      error
+  end.
+
+expand_require(Meta, Receiver, {Name, Arity} = Tuple, Args, E) ->
+  check_deprecated(Meta, Receiver, Name, Arity, E),
+  Required = (Receiver == ?key(E, module)) orelse required(Meta) orelse is_element(Receiver, ?key(E, requires)),
+
+  case is_element(Tuple, get_macros(Receiver, Required)) of
+    true when Required ->
+      elixir_env:trace({remote_macro, Meta, Receiver, Name, Arity}, E),
+      {ok, Receiver, expand_macro_named(Meta, Receiver, Name, Arity, Args, E)};
+    true ->
+      Info = {unrequired_module, {Receiver, Name, length(Args)}},
+      elixir_errors:form_error(Meta, E, ?MODULE, Info);
+    false ->
+      error
   end.
 
 %% Expansion helpers
 
-expand_macro_fun(Meta, Fun, Receiver, Name, Args, Module, S) ->
-  Requires = S#elixir_scope.requires,
-  case (Receiver == Module) or is_element(Receiver, Requires) or skip_require(Meta) of
-    true  -> ok;
-    false ->
-      Tuple = { unrequired_module, { Receiver, Name, length(Args), Requires } },
-      elixir_errors:form_error(Meta, S#elixir_scope.file, ?MODULE, Tuple)
-  end,
-
+expand_macro_fun(Meta, Fun, Receiver, Name, Args, E) ->
   Line = ?line(Meta),
-  SArg = {Line,S},
+  EArg = {Line, E},
 
   try
-    apply(Fun, [SArg|Args])
+    apply(Fun, [EArg | Args])
   catch
-    Kind:Reason ->
-      Info = { Receiver, Name, length(Args), location(Line, S) },
-      erlang:raise(Kind, Reason, munge_stacktrace(Info, erlang:get_stacktrace(), SArg))
+    Kind:Reason:Stacktrace ->
+      Arity = length(Args),
+      MFA  = {Receiver, elixir_utils:macro_name(Name), Arity+1},
+      Info = [{Receiver, Name, Arity, [{file, "expanding macro"}]}, caller(Line, E)],
+      erlang:raise(Kind, Reason, prune_stacktrace(Stacktrace, MFA, Info, {ok, EArg}))
   end.
 
-expand_macro_named(Meta, Receiver, Name, Arity, Args, Module, S) ->
-  ProperName  = ?elixir_macro(Name),
+expand_macro_named(Meta, Receiver, Name, Arity, Args, E) ->
+  ProperName  = elixir_utils:macro_name(Name),
   ProperArity = Arity + 1,
   Fun         = fun Receiver:ProperName/ProperArity,
-  expand_macro_fun(Meta, Fun, Receiver, Name, Args, Module, S).
+  expand_macro_fun(Meta, Fun, Receiver, Name, Args, E).
 
-translate_expansion(Meta, Tree, S) ->
+expand_quoted(Meta, Receiver, Name, Arity, Quoted, E) ->
   Line = ?line(Meta),
+  Next = elixir_module:next_counter(?key(E, module)),
 
   try
-    elixir_translator:translate_each(
-      elixir_quote:linify(Line, Tree),
-      S
-    )
+    elixir_expand:expand(
+      elixir_quote:linify_with_context_counter(Line, {Receiver, Next}, Quoted),
+      E)
   catch
-    Kind:Reason ->
-      erlang:raise(Kind, Reason, munge_stacktrace(mfa(Line, S), erlang:get_stacktrace(), nil))
+    Kind:Reason:Stacktrace ->
+      MFA  = {Receiver, elixir_utils:macro_name(Name), Arity+1},
+      Info = [{Receiver, Name, Arity, [{file, "expanding macro"}]}, caller(Line, E)],
+      erlang:raise(Kind, Reason, prune_stacktrace(Stacktrace, MFA, Info, error))
   end.
 
-mfa(Line, #elixir_scope{module=nil} = S) ->
-  { elixir_compiler, '__FILE__', 2, location(Line, S) };
-
-mfa(Line, #elixir_scope{module=Module,function=nil} = S) ->
-  { Module, '__MODULE__', 0, location(Line, S) };
-
-mfa(Line, #elixir_scope{module=Module,function={ Name, Arity }} = S) ->
-  { Module, Name, Arity, location(Line, S) }.
-
-location(Line, S) ->
-  [{ file, S#elixir_scope.file }, { line, Line }].
+caller(Line, E) ->
+  elixir_utils:caller(Line, ?key(E, file), ?key(E, module), ?key(E, function)).
 
 %% Helpers
 
-skip_require(Meta) ->
-  lists:keyfind(require, 1, Meta) == { require, false }.
+required(Meta) ->
+  lists:keyfind(required, 1, Meta) == {required, true}.
 
-find_dispatch(Meta, Tuple, S) ->
-  find_dispatch(Meta, Tuple, [], S).
-
-find_dispatch(Meta, Tuple, Extra, S) ->
-  case is_import(Meta, Tuple, S) of
-    { import, _ } = Import ->
+find_dispatch(Meta, Tuple, Extra, E) ->
+  case is_import(Meta) of
+    {import, _} = Import ->
       Import;
     false ->
-      Functions = S#elixir_scope.functions,
-      Macros = Extra ++ S#elixir_scope.macros,
-      File = S#elixir_scope.file,
-      FunMatch = find_dispatch(Tuple, Functions),
-      MacMatch = find_dispatch(Tuple, Macros),
+      Funs = ?key(E, functions),
+      Macs = Extra ++ ?key(E, macros),
+      FunMatch = find_dispatch(Tuple, Funs),
+      MacMatch = find_dispatch(Tuple, Macs),
 
-      case { FunMatch, MacMatch } of
-        { [], [Receiver] } -> { macro, Receiver };
-        { [Receiver], [] } -> { function, Receiver };
-        { [], [] } -> false;
+      case {FunMatch, MacMatch} of
+        {[], [Receiver]} -> {macro, Receiver};
+        {[Receiver], []} -> {function, Receiver};
+        {[], []} -> false;
         _ ->
-          { Name, Arity } = Tuple,
-          [First, Second|_] = FunMatch ++ MacMatch,
-          Error = { ambiguous_call, { First, Second, Name, Arity } },
-          elixir_errors:form_error(Meta, File, ?MODULE, Error)
+          {Name, Arity} = Tuple,
+          [First, Second | _] = FunMatch ++ MacMatch,
+          Error = {ambiguous_call, {First, Second, Name, Arity}},
+          elixir_errors:form_error(Meta, E, ?MODULE, Error)
       end
   end.
 
 find_dispatch(Tuple, List) ->
-  [Receiver || { Receiver, Set } <- List, is_element(Tuple, Set)].
+  [Receiver || {Receiver, Set} <- List, is_element(Tuple, Set)].
 
-is_import(Meta, Tuple, S) ->
+is_import(Meta) ->
   case lists:keyfind(import, 1, Meta) of
-    { import, _ } = Import ->
+    {import, _} = Import ->
       case lists:keyfind(context, 1, Meta) of
-        { context, Context } ->
-          not_an_import(Tuple, Context, S#elixir_scope.macro_functions)
-            andalso not_an_import(Tuple, Context, S#elixir_scope.macro_macros)
-            andalso Import;
-        false ->
-          false
+        {context, _} -> Import;
+        false -> false
       end;
-    false ->
-      false
+    false -> false
   end.
 
-not_an_import(Tuple, Context, Dict) ->
-  case orddict:find(Context, Dict) of
-    { ok, Pairs } ->
-      not lists:any(fun({ _, List }) -> lists:member(Tuple, List) end, Pairs);
-    error ->
-      true
-  end.
-
-%% We've reached the invoked macro, skip it with the rest
-munge_stacktrace(Info, [{ _, _, [S|_], _ }|_], S) ->
-  [Info];
-
+% %% We've reached the macro wrapper fun, skip it with the rest
+prune_stacktrace([{_, _, [E | _], _} | _], _MFA, Info, {ok, E}) ->
+  Info;
+%% We've reached the invoked macro, skip it
+prune_stacktrace([{M, F, A, _} | _], {M, F, A}, Info, _E) ->
+  Info;
 %% We've reached the elixir_dispatch internals, skip it with the rest
-munge_stacktrace(Info, [{ elixir_dispatch, _, _, _ }|_], _) ->
-  [Info];
-
-munge_stacktrace(Info, [H|T], S) ->
-  [H|munge_stacktrace(Info, T, S)];
-
-munge_stacktrace(Info, [], _) ->
-  [Info].
-
-remote_function(Meta, Receiver, Name, Arity, S) ->
-  Line  = ?line(Meta),
-
-  Final =
-    case (Receiver == ?builtin) andalso is_element({ Name, Arity }, in_erlang_functions()) of
-      true  -> erlang;
-      false -> Receiver
-    end,
-
-  { { 'fun', Line, { function,
-    { atom, Line, Final },
-    { atom, Line, Name },
-    { integer, Line, Arity}
-  } }, S }.
-
+prune_stacktrace([{Mod, _, _, _} | _], _MFA, Info, _E) when Mod == elixir_dispatch; Mod == elixir_exp ->
+  Info;
+prune_stacktrace([H | T], MFA, Info, E) ->
+  [H | prune_stacktrace(T, MFA, Info, E)];
+prune_stacktrace([], _MFA, Info, _E) ->
+  Info.
 
 %% ERROR HANDLING
 
-format_error({ unrequired_module, { Receiver, Name, Arity, Required }}) ->
-  String = 'Elixir.Enum':join([elixir_errors:inspect(R) || R <- Required], <<", ">>),
-  io_lib:format("tried to invoke macro ~ts.~ts/~B but module was not required. Required: ~ts",
-    [elixir_errors:inspect(Receiver), Name, Arity, String]);
-
-format_error({ macro_conflict, { Receiver, Name, Arity } }) ->
-  io_lib:format("call to local macro ~ts/~B conflicts with imported ~ts.~ts/~B",
-    [Name, Arity, elixir_errors:inspect(Receiver), Name, Arity]);
-
-format_error({ ambiguous_call, { Mod1, Mod2, Name, Arity }}) ->
+format_error({unrequired_module, {Receiver, Name, Arity}}) ->
+  Module = elixir_aliases:inspect(Receiver),
+  io_lib:format("you must require ~ts before invoking the macro ~ts.~ts/~B",
+    [Module, Module, Name, Arity]);
+format_error({macro_conflict, {Receiver, Name, Arity}}) ->
+  io_lib:format("call to local macro ~ts/~B conflicts with imported ~ts.~ts/~B, "
+    "please rename the local macro or remove the conflicting import",
+    [Name, Arity, elixir_aliases:inspect(Receiver), Name, Arity]);
+format_error({ambiguous_call, {Mod1, Mod2, Name, Arity}}) ->
   io_lib:format("function ~ts/~B imported from both ~ts and ~ts, call is ambiguous",
-    [Name, Arity, elixir_errors:inspect(Mod1), elixir_errors:inspect(Mod2)]).
+    [Name, Arity, elixir_aliases:inspect(Mod1), elixir_aliases:inspect(Mod2)]);
+format_error({deprecated, Mod, '__using__', 1, Message}) ->
+  io_lib:format("use ~s is deprecated. ~s", [elixir_aliases:inspect(Mod), Message]);
+format_error({deprecated, Mod, Fun, Arity, Message}) ->
+  io_lib:format("~s.~s/~B is deprecated. ~s",[elixir_aliases:inspect(Mod), Fun, Arity, Message]).
 
 %% INTROSPECTION
 
-%% Do not try to get macros from Erlang. Speeds up compilation a bit.
-get_optional_macros(erlang) -> [];
+is_ensure_loaded(Receiver) ->
+  code:ensure_loaded(Receiver) == {module, Receiver}.
 
-get_optional_macros(Receiver) ->
-  case code:ensure_loaded(Receiver) of
-    { module, Receiver } ->
+%% Do not try to get macros from Erlang. Speeds up compilation a bit.
+get_macros(erlang, _) -> [];
+
+%% Module was not required, so we don't try to load it.
+get_macros(Receiver, false) ->
+  case erlang:module_loaded(Receiver) of
+    true -> get_info(Receiver, macros);
+    false -> []
+  end;
+
+%% If module was required, do a function call to force
+%% the error handler in.
+get_macros(Receiver, true) ->
+  try
+    Receiver:'__info__'(macros)
+  catch
+    error:_ -> []
+  end.
+
+%% Deprecations checks only happen at the module body,
+%% so in there we can try to at least load the module.
+get_deprecations(Receiver) ->
+  case is_ensure_loaded(Receiver) of
+    true -> get_info(Receiver, deprecated);
+    false -> []
+  end.
+
+get_info(Receiver, Key) ->
+  case erlang:function_exported(Receiver, '__info__', 1) of
+    true ->
       try
-        Receiver:'__info__'(macros)
+        Receiver:'__info__'(Key)
       catch
-        error:undef -> []
+        error:_ -> []
       end;
-    { error, _ } -> []
+    false ->
+      []
   end.
 
 elixir_imported_functions() ->
   try
-    ?builtin:'__info__'(functions)
-  catch
-    error:undef -> in_erlang_functions()
-  end.
-
-elixir_imported_macros() ->
-  try
-    ?builtin:'__info__'(macros)
-  catch
-    error:undef -> in_erlang_macros()
-  end.
-
-%% Macros imported from Kernel module. Sorted on compilation.
-
-in_elixir_macros() ->
-  try
-    ?builtin:'__info__'(macros)
+    ?kernel:'__info__'(functions)
   catch
     error:undef -> []
   end.
 
-%% Functions imported from Erlang module. MUST BE SORTED.
-in_erlang_functions() ->
-  [
-    { abs, 1 },
-    { atom_to_binary, 2 },
-    { atom_to_list, 1 },
-    { binary_part, 3 },
-    { binary_to_atom, 2 },
-    { binary_to_existing_atom, 2 },
-    { binary_to_float, 1 },
-    { binary_to_float, 2 },
-    { binary_to_integer, 1 },
-    { binary_to_integer, 2 },
-    { binary_to_term, 1 },
-    { binary_to_term, 2 },
-    { bit_size, 1 },
-    { bitstring_to_list, 1 },
-    { byte_size, 1 },
-    % { date, 0 },
-    { exit, 1 },
-    % { float, 1 },
-    { float_to_binary, 1 },
-    { float_to_list, 1 },
-    { hd, 1 },
-    { integer_to_binary, 1 },
-    { integer_to_binary, 2 },
-    { integer_to_list, 1 },
-    { integer_to_list, 2 },
-    { iolist_size, 1 },
-    { iolist_to_binary, 1 },
-    { is_alive, 0 },
-    { is_atom, 1 },
-    { is_binary, 1 },
-    { is_bitstring, 1 },
-    { is_boolean, 1 },
-    { is_float, 1 },
-    { is_function, 1 },
-    { is_function, 2 },
-    { is_integer, 1 },
-    { is_list, 1 },
-    { is_number, 1 },
-    { is_pid, 1 },
-    { is_port, 1 },
-    { is_reference, 1 },
-    { is_tuple, 1 },
-    { length, 1 },
-    { list_to_atom, 1 },
-    { list_to_bitstring, 1 },
-    { list_to_existing_atom, 1 },
-    { list_to_float, 1 },
-    { list_to_integer, 1 },
-    { list_to_integer, 2 },
-    { list_to_pid, 1 },
-    { list_to_tuple, 1 },
-    { make_ref, 0 },
-    { max, 2 },
-    { min, 2 },
-    { node, 0 },
-    { node, 1 },
-    % { now, 0 },
-    { pid_to_list, 1 },
-    { round, 1 },
-    { self, 0 },
-    { size, 1 },
-    { spawn, 1 },
-    { spawn, 3 },
-    { spawn_link, 1 },
-    { spawn_link, 3 },
-    % { split_binary, 2 },
-    { term_to_binary, 1 },
-    { term_to_binary, 2 },
-    { throw, 1 },
-    % { time, 0 },
-    { tl, 1 },
-    { trunc, 1 },
-    { tuple_size, 1 },
-    { tuple_to_list, 1 }
-  ].
+elixir_imported_macros() ->
+  try
+    ?kernel:'__info__'(macros)
+  catch
+    error:undef -> []
+  end.
 
-%% Macros implemented in Erlang. MUST BE SORTED.
-in_erlang_macros() ->
-  [
-    {'!',1},
-    {'!=',2},
-    {'!==',2},
-    {'*',2},
-    {'+',1},
-    {'+',2},
-    {'++',2},
-    {'-',1},
-    {'-',2},
-    {'--',2},
-    {'/',2},
-    {'<',2},
-    {'<-',2},
-    {'<=',2},
-    {'==',2},
-    {'===',2},
-    {'>',2},
-    {'>=',2},
-    {'@',1},
-    {'and',2},
-    {apply,2},
-    {apply,3},
-    {'case',2},
-    {def,1},
-    {def,2},
-    {def,4},
-    {defmacro,1},
-    {defmacro,2},
-    {defmacro,4},
-    {defmacrop,1},
-    {defmacrop,2},
-    {defmacrop,4},
-    {defmodule,2},
-    {defp,1},
-    {defp,2},
-    {defp,4},
-    {in,2},
-    {'not',1},
-    {'or',2},
-    {'receive',1},
-    {'try',1},
-    {'xor',2}
-  ].
+check_deprecated(_, erlang, _, _, _) ->
+  ok;
+check_deprecated(_, ?kernel, _, _, _) ->
+  ok;
+check_deprecated(Meta, Receiver, Name, Arity, E) ->
+  case (?key(E, function) == nil) andalso get_deprecations(Receiver) of
+    [_ | _] = Deprecations ->
+      case lists:keyfind({Name, Arity}, 1, Deprecations) of
+        {_, Message} ->
+          elixir_errors:form_warn(Meta, E, ?MODULE, {deprecated, Receiver, Name, Arity, Message});
+
+        false ->
+          false
+      end;
+
+    _ ->
+      ok
+  end.

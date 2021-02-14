@@ -1,168 +1,375 @@
-Code.require_file "test_helper.exs", __DIR__
-
-defrecord RecordTest.FileInfo,
-  Record.extract(:file_info, from_lib: "kernel/include/file.hrl")
-
-defrecord RecordTest.SomeRecord, a: 0, b: 1
-defrecord RecordTest.WithNoField, []
-
-## Record import
-
-defmodule RecordTest.FileInfo.Helper do
-  Record.import RecordTest.FileInfo, as: :file_info
-
-  def new do
-    file_info
-  end
-
-  def size(file_info(size: size)), do: size
-end
-
-## Dynamic names and overridable
-
-name = RecordTest.DynamicName
-defrecord name, a: 0, b: 1 do
-  defoverridable [update_b: 2]
-
-  def update_b(_, _) do
-    :not_optimizable
-  end
-
-  Record.import __MODULE__, as: :self
-end
-
-defmodule RecordTest.DynamicOpts do
-  @a [foo: 1..30]
-  defrecord State, (lc {name, _interval} inlist @a, do: {name, nil})
-end
-
-## With types
-
-defrecord RecordTest.WithTypeOverriden, a: 0, b: 1 do
-  @type t :: __MODULE__[a: integer, b: any]
-end
-
-defrecord RecordTest.WithRecordType, a: 0, b: 1 do
-  record_type a: non_pos_integer
-  record_type a: integer
-end
-
-defmodule RecordTest.Macros do
-  defmacro gen do
-    quote do
-      alias RecordTest.Macros.Nested
-
-      def this_works, do: RecordTest.Macros.Nested[]
-      def this_should_too, do: Nested[]
-    end
-  end
-
-  defrecord Nested do
-    def nested_record_alias?(Nested[]) do
-      true
-    end
-
-    defrecord NestedInNested, it_compiles: true
-  end
-
-  # Ensure there is no conflict in a nested module
-  # named record.
-  defrecord Record, [a: 1, b: 2]
-end
+Code.require_file("test_helper.exs", __DIR__)
 
 defmodule RecordTest do
   use ExUnit.Case, async: true
 
-  # Check the access from the generated macro works
-  # as expected. If it compiles, we are good to go.
-  require RecordTest.Macros
-  RecordTest.Macros.gen
+  require Record
+  doctest Record
 
-  test :basic_functions do
-    record   = RecordTest.FileInfo.new(type: :regular)
-    assert record.type == :regular
-    assert record.access == :undefined
+  test "extract/2 extracts information from an Erlang file" do
+    assert Record.extract(:file_info, from_lib: "kernel/include/file.hrl") == [
+             size: :undefined,
+             type: :undefined,
+             access: :undefined,
+             atime: :undefined,
+             mtime: :undefined,
+             ctime: :undefined,
+             mode: :undefined,
+             links: :undefined,
+             major_device: :undefined,
+             minor_device: :undefined,
+             inode: :undefined,
+             uid: :undefined,
+             gid: :undefined
+           ]
   end
 
-  test :dynamic_record_name do
-    record = RecordTest.DynamicName.new
-    assert record.a == 0
-    assert record.b == 1
+  test "extract/2 handles nested records too" do
+    namespace = Record.extract(:xmlElement, from_lib: "xmerl/include/xmerl.hrl")[:namespace]
+    assert is_tuple(namespace)
+    assert elem(namespace, 0) == :xmlNamespace
   end
 
-  test :dynamic_update do
-    record = RecordTest.DynamicName.new
-    assert record.update_a(&(10 + &1)).a == 10
+  test "extract/2 with defstruct" do
+    defmodule StructExtract do
+      defstruct Record.extract(:file_info, from_lib: "kernel/include/file.hrl")
+    end
+
+    assert %{__struct__: StructExtract, size: :undefined} = StructExtract.__struct__()
   end
 
-  test :is_record do
-    assert is_record(RecordTest.FileInfo.new, RecordTest.FileInfo)
-    assert is_record(RecordTest.WithNoField.new)
-    refute is_record(empty_tuple)
-    refute is_record(a_list)
-    refute is_record(empty_tuple, RecordTest.FileInfo)
-    refute is_record(a_tuple, RecordTest.FileInfo)
-    refute is_record(a_list, RecordTest.FileInfo)
-    refute is_record(RecordTest.FileInfo.new, List)
+  test "extract_all/1 extracts all records information from an Erlang file" do
+    all_extract = Record.extract_all(from_lib: "kernel/include/file.hrl")
+    # has been stable over the very long time
+    assert length(all_extract) == 2
+    assert all_extract[:file_info]
+    assert all_extract[:file_descriptor]
   end
 
-  test :__record_index__ do
-    record = RecordTest.DynamicName.new(a: "a", b: "b")
-    assert record.__record__(:index, :a) == 1
-    assert elem(record, record.__record__(:index, :a)) == "a"
-    assert elem(record, record.__record__(:index, :b)) == "b"
-    assert record.__record__(:index, :c) == nil
-    record = RecordTest.FileInfo.new
-    assert RecordTest.FileInfo.__record__(:index, :atime) == record.__record__(:index, :atime)
+  # We need indirection to avoid warnings
+  defp record?(data, kind) do
+    Record.is_record(data, kind)
   end
 
-  test :to_keywords do
-    record = RecordTest.DynamicName.new(a: "a", b: "b")
-    assert record.to_keywords[:a] == "a"
-    assert record.to_keywords[:b] == "b"
+  test "is_record/2" do
+    assert record?({User, "meg", 27}, User)
+    refute record?({User, "meg", 27}, Author)
+    refute record?(13, Author)
+    refute record?({"user", "meg", 27}, "user")
+    refute record?({}, User)
+    refute record?([], User)
   end
 
-  test :record_update do
-    record = RecordTest.SomeRecord.new
-    assert RecordTest.SomeRecord.a(record.update(a: 2, b: 3)) == 2
-    assert RecordTest.SomeRecord.b(record.update(a: 2, b: 3)) == 3
-    assert RecordTest.SomeRecord.a(record.update(a: 2)) == 2
-    assert RecordTest.SomeRecord.b(record.update(b: 2)) == 2
+  # We need indirection to avoid warnings
+  defp record?(data) do
+    Record.is_record(data)
   end
 
-  test :optimizable do
-    assert { :b, 1 } in RecordTest.SomeRecord.__record__(:optimizable)
-    assert { :b, 2 } in RecordTest.SomeRecord.__record__(:optimizable)
-    assert { :update_b, 2 } in RecordTest.SomeRecord.__record__(:optimizable)
-    refute { :update_b, 2 } in RecordTest.DynamicName.__record__(:optimizable)
+  test "is_record/1" do
+    assert record?({User, "john", 27})
+    refute record?({"john", 27})
+    refute record?(13)
+    refute record?({})
   end
 
-  test :result do
-    assert { :module, _, _, "result"} = (defrecord WithResult, foo: :bar do
-      "result"
-    end)
+  def record_in_guard?(term) when Record.is_record(term), do: true
+  def record_in_guard?(_), do: false
+
+  def record_in_guard?(term, kind) when Record.is_record(term, kind), do: true
+  def record_in_guard?(_, _), do: false
+
+  test "is_record/1,2 (in guard)" do
+    assert record_in_guard?({User, "john", 27})
+    refute record_in_guard?({"user", "john", 27})
+
+    assert record_in_guard?({User, "john", 27}, User)
+    refute record_in_guard?({"user", "john", 27}, "user")
   end
 
-  test :import do
-    assert RecordTest.FileInfo.Helper.new == RecordTest.FileInfo.new
-    assert RecordTest.FileInfo.Helper.size(RecordTest.FileInfo.new(size: 100)) == 100
+  Record.defrecord(:timestamp, [:date, :time])
+  Record.defrecord(:user, __MODULE__, name: "john", age: 25)
+
+  Record.defrecordp(:file_info, Record.extract(:file_info, from_lib: "kernel/include/file.hrl"))
+
+  Record.defrecordp(
+    :certificate,
+    :OTPCertificate,
+    Record.extract(:OTPCertificate, from_lib: "public_key/include/public_key.hrl")
+  )
+
+  test "records are tagged" do
+    assert elem(file_info(), 0) == :file_info
   end
 
-  test :record_with_functions_as_defaults do
-    defrecord WithFun, fun: [&Kernel.is_atom/1]
-    assert WithFun.new.fun == [&Kernel.is_atom/1]
+  test "records macros" do
+    record = user()
+    assert user(record, :name) == "john"
+    assert user(record, :age) == 25
 
-    assert_raise ArgumentError, "record field default value :bar can only contain functions that point to an existing &Mod.fun/arity", fn ->
-      defrecord Foo, bar: [fn x -> x end]
+    record = user(record, name: "meg")
+    assert user(record, :name) == "meg"
+
+    assert elem(record, user(:name)) == "meg"
+    assert elem(record, 0) == RecordTest
+
+    user(name: name) = record
+    assert name == "meg"
+
+    assert user(:name) == 1
+  end
+
+  test "records with default values" do
+    record = user(_: :_, name: "meg")
+    assert user(record, :name) == "meg"
+    assert user(record, :age) == :_
+    assert match?(user(_: _), user())
+  end
+
+  test "records preserve side-effects order" do
+    user =
+      user(
+        age: send(self(), :age),
+        name: send(self(), :name)
+      )
+
+    assert Process.info(self(), :messages) == {:messages, [:age, :name]}
+
+    _ =
+      user(user,
+        age: send(self(), :update_age),
+        name: send(self(), :update_name)
+      )
+
+    assert Process.info(self(), :messages) ==
+             {:messages, [:age, :name, :update_age, :update_name]}
+  end
+
+  test "nested records preserve side-effects order" do
+    user =
+      user(
+        age:
+          user(
+            age: send(self(), :inner_age),
+            name: send(self(), :inner_name)
+          ),
+        name: send(self(), :name)
+      )
+
+    assert user == {RecordTest, :name, {RecordTest, :inner_name, :inner_age}}
+    assert for(_ <- 1..3, do: assert_receive(_)) == [:inner_age, :inner_name, :name]
+
+    user =
+      user(
+        name: send(self(), :name),
+        age:
+          user(
+            age: send(self(), :inner_age),
+            name: send(self(), :inner_name)
+          )
+      )
+
+    assert user == {RecordTest, :name, {RecordTest, :inner_name, :inner_age}}
+    assert for(_ <- 1..3, do: assert_receive(_)) == [:name, :inner_age, :inner_name]
+  end
+
+  Record.defrecord(
+    :defaults,
+    struct: ~D[2016-01-01],
+    map: %{},
+    tuple_zero: {},
+    tuple_one: {1},
+    tuple_two: {1, 2},
+    tuple_three: {1, 2, 3},
+    list: [1, 2, 3],
+    call: MapSet.new(),
+    string: "abc",
+    binary: <<1, 2, 3>>,
+    charlist: 'abc'
+  )
+
+  test "records with literal defaults and on-the-fly record" do
+    assert defaults(defaults()) == [
+             struct: ~D[2016-01-01],
+             map: %{},
+             tuple_zero: {},
+             tuple_one: {1},
+             tuple_two: {1, 2},
+             tuple_three: {1, 2, 3},
+             list: [1, 2, 3],
+             call: MapSet.new(),
+             string: "abc",
+             binary: <<1, 2, 3>>,
+             charlist: 'abc'
+           ]
+
+    assert defaults(defaults(), :struct) == ~D[2016-01-01]
+    assert defaults(defaults(), :map) == %{}
+    assert defaults(defaults(), :tuple_zero) == {}
+    assert defaults(defaults(), :tuple_one) == {1}
+    assert defaults(defaults(), :tuple_two) == {1, 2}
+    assert defaults(defaults(), :tuple_three) == {1, 2, 3}
+    assert defaults(defaults(), :list) == [1, 2, 3]
+    assert defaults(defaults(), :call) == MapSet.new()
+    assert defaults(defaults(), :string) == "abc"
+    assert defaults(defaults(), :binary) == <<1, 2, 3>>
+    assert defaults(defaults(), :charlist) == 'abc'
+  end
+
+  test "records with literal defaults and record in a variable" do
+    defaults = defaults()
+
+    assert defaults(defaults) == [
+             struct: ~D[2016-01-01],
+             map: %{},
+             tuple_zero: {},
+             tuple_one: {1},
+             tuple_two: {1, 2},
+             tuple_three: {1, 2, 3},
+             list: [1, 2, 3],
+             call: MapSet.new(),
+             string: "abc",
+             binary: <<1, 2, 3>>,
+             charlist: 'abc'
+           ]
+
+    assert defaults(defaults, :struct) == ~D[2016-01-01]
+    assert defaults(defaults, :map) == %{}
+    assert defaults(defaults, :tuple_zero) == {}
+    assert defaults(defaults, :tuple_one) == {1}
+    assert defaults(defaults, :tuple_two) == {1, 2}
+    assert defaults(defaults, :tuple_three) == {1, 2, 3}
+    assert defaults(defaults, :list) == [1, 2, 3]
+    assert defaults(defaults, :call) == MapSet.new()
+    assert defaults(defaults, :string) == "abc"
+    assert defaults(defaults, :binary) == <<1, 2, 3>>
+    assert defaults(defaults, :charlist) == 'abc'
+  end
+
+  test "records with dynamic arguments" do
+    record = file_info()
+    assert file_info(record, :size) == :undefined
+
+    record = user()
+    assert user(record) == [name: "john", age: 25]
+    assert user(user()) == [name: "john", age: 25]
+
+    msg =
+      "expected argument to be a literal atom, literal keyword or a :file_info record, " <>
+        "got runtime: {RecordTest, \"john\", 25}"
+
+    assert_raise ArgumentError, msg, fn ->
+      file_info(record)
+    end
+
+    pretender = {RecordTest, "john"}
+
+    msg =
+      "expected argument to be a RecordTest record with 2 fields, " <>
+        "got: {RecordTest, \"john\"}"
+
+    assert_raise ArgumentError, msg, fn ->
+      user(pretender)
+    end
+
+    pretender = {RecordTest, "john", 25, []}
+
+    msg =
+      "expected argument to be a RecordTest record with 2 fields, " <>
+        "got: {RecordTest, \"john\", 25, []}"
+
+    assert_raise ArgumentError, msg, fn ->
+      user(pretender)
     end
   end
 
-  test :extract_with_nested_records do
-    namespace = Record.extract(:xmlElement, from_lib: "xmerl/include/xmerl.hrl")[:namespace]
-    assert is_record(namespace, :xmlNamespace)
+  test "records visibility" do
+    assert macro_exported?(__MODULE__, :user, 0)
+    refute macro_exported?(__MODULE__, :file_info, 1)
   end
 
-  defp empty_tuple, do: {}
-  defp a_tuple, do: { :foo, :bar, :baz }
-  defp a_list,  do: [ :foo, :bar, :baz ]
+  test "records with no defaults" do
+    record = timestamp()
+    assert timestamp(record, :date) == nil
+    assert timestamp(record, :time) == nil
+
+    record = timestamp(date: :foo, time: :bar)
+    assert timestamp(record, :date) == :foo
+    assert timestamp(record, :time) == :bar
+  end
+
+  test "records defined multiple times" do
+    msg = "cannot define record :r because a definition r/0 already exists"
+
+    assert_raise ArgumentError, msg, fn ->
+      defmodule M do
+        import Record
+        defrecord :r, [:a]
+        defrecord :r, [:a]
+      end
+    end
+  end
+
+  test "macro and record with the same name defined" do
+    msg = "cannot define record :a because a definition a/1 already exists"
+
+    assert_raise ArgumentError, msg, fn ->
+      defmodule M do
+        defmacro a(_) do
+        end
+
+        require Record
+        Record.defrecord(:a, [:a])
+      end
+    end
+
+    msg = "cannot define record :a because a definition a/2 already exists"
+
+    assert_raise ArgumentError, msg, fn ->
+      defmodule M do
+        defmacro a(_, _) do
+        end
+
+        require Record
+        Record.defrecord(:a, [:a])
+      end
+    end
+  end
+
+  describe "warnings" do
+    import ExUnit.CaptureIO
+
+    test "warns on bad record update input" do
+      assert capture_io(:stderr, fn ->
+               defmodule RecordSample do
+                 require Record
+                 Record.defrecord(:user, __MODULE__, name: "john", age: 25)
+
+                 def fun do
+                   user(user(), _: :_, name: "meg")
+                 end
+               end
+             end) =~
+               "updating a record with a default (:_) is equivalent to creating a new record"
+    after
+      purge(RecordSample)
+    end
+
+    test "defrecord warns with duplicate keys" do
+      assert capture_io(:stderr, fn ->
+               Code.eval_string("""
+               defmodule RecordSample do
+                 import Record
+                 defrecord :r, [:foo, :bar, foo: 1]
+               end
+               """)
+             end) =~ "duplicate key :foo found in record"
+    after
+      purge(RecordSample)
+    end
+
+    defp purge(module) when is_atom(module) do
+      :code.delete(module)
+      :code.purge(module)
+    end
+  end
 end

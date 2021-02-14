@@ -1,117 +1,247 @@
-defrecord EEx.State, engine: EEx.SmartEngine, dict: [], file: 'nofile', line: 1, start_line: 1
-
 defmodule EEx.Compiler do
   @moduledoc false
+
+  # When changing this setting, don't forget to update the docs for EEx
+  @default_engine EEx.SmartEngine
 
   @doc """
   This is the compilation entry point. It glues the tokenizer
   and the engine together by handling the tokens and invoking
   the engine every time a full expression or text is received.
   """
-  def compile(source, options) do
-    line   = Keyword.get(options, :line, 1)
-    tokens = EEx.Tokenizer.tokenize(source, line)
-    state  = EEx.State.new(options)
-    generate_buffer(tokens, "", [], state)
+  @spec compile(String.t(), keyword) :: Macro.t()
+  def compile(source, opts) when is_binary(source) and is_list(opts) do
+    file = opts[:file] || "nofile"
+    line = opts[:line] || 1
+    column = 1
+    indentation = opts[:indentation] || 0
+    trim = opts[:trim] || false
+    tokenizer_options = %{trim: trim, indentation: indentation}
+
+    case EEx.Tokenizer.tokenize(source, line, column, tokenizer_options) do
+      {:ok, tokens} ->
+        state = %{
+          engine: opts[:engine] || @default_engine,
+          file: file,
+          line: line,
+          quoted: [],
+          start_line: nil,
+          start_column: nil,
+          parser_options: Code.get_compiler_option(:parser_options)
+        }
+
+        init = state.engine.init(opts)
+        generate_buffer(tokens, init, [], state)
+
+      {:error, line, column, message} ->
+        raise EEx.SyntaxError, file: file, line: line, column: column, message: message
+    end
   end
 
-  # Generates the buffers by handling each expression from the tokenizer
+  # Generates the buffers by handling each expression from the tokenizer.
+  # It returns Macro.t/0 or it raises.
 
-  defp generate_buffer([{ :text, _line, chars }|t], buffer, scope, state) do
-    buffer = state.engine.handle_text(buffer, chars)
-    generate_buffer(t, buffer, scope, state)
+  defp generate_buffer([{:text, line, column, chars} | rest], buffer, scope, state) do
+    buffer =
+      if function_exported?(state.engine, :handle_text, 3) do
+        meta = [line: line, column: column]
+        state.engine.handle_text(buffer, meta, IO.chardata_to_string(chars))
+      else
+        # TODO: Remove this branch on Elixir v2.0
+        state.engine.handle_text(buffer, IO.chardata_to_string(chars))
+      end
+
+    generate_buffer(rest, buffer, scope, state)
   end
 
-  defp generate_buffer([{ :expr, line, mark, chars }|t], buffer, scope, state) do
-    expr = maybe_block :elixir_translator.forms!(chars, line, state.file, [])
-    buffer = state.engine.handle_expr(buffer, mark, expr)
-    generate_buffer(t, buffer, scope, state)
+  defp generate_buffer([{:expr, line, column, mark, chars} | rest], buffer, scope, state) do
+    options = [file: state.file, line: line, column: column(column, mark)] ++ state.parser_options
+    expr = Code.string_to_quoted!(chars, options)
+    buffer = state.engine.handle_expr(buffer, IO.chardata_to_string(mark), expr)
+    generate_buffer(rest, buffer, scope, state)
   end
 
-  defp generate_buffer([{ :start_expr, line, mark, chars }|t], buffer, scope, state) do
-    { contents, t } = generate_buffer(t, "", [chars|scope], state.dict([]).line(line).start_line(line))
-    buffer = state.engine.handle_expr(buffer, mark, contents)
-    generate_buffer(t, buffer, scope, state)
+  defp generate_buffer(
+         [{:start_expr, start_line, start_column, mark, chars} | rest],
+         buffer,
+         scope,
+         state
+       ) do
+    if mark != '=' do
+      message =
+        "the contents of this expression won't be output unless the EEx block starts with \"<%=\""
+
+      :elixir_errors.erl_warn(start_line, state.file, message)
+    end
+
+    {contents, line, rest} = look_ahead_middle(rest, start_line, chars)
+
+    {contents, rest} =
+      generate_buffer(
+        rest,
+        state.engine.handle_begin(buffer),
+        [contents | scope],
+        %{
+          state
+          | quoted: [],
+            line: line,
+            start_line: start_line,
+            start_column: column(start_column, mark)
+        }
+      )
+
+    buffer = state.engine.handle_expr(buffer, IO.chardata_to_string(mark), contents)
+    generate_buffer(rest, buffer, scope, state)
   end
 
-  defp generate_buffer([{ :middle_expr, line, _, chars }|t], buffer, [current|scope], state) do
-    { wrapped, state } = wrap_expr(current, line, buffer, chars, state)
-    generate_buffer(t, "", [wrapped|scope], state.line(line))
+  defp generate_buffer(
+         [{:middle_expr, line, _column, '', chars} | rest],
+         buffer,
+         [current | scope],
+         state
+       ) do
+    {wrapped, state} = wrap_expr(current, line, buffer, chars, state)
+    state = %{state | line: line}
+    generate_buffer(rest, state.engine.handle_begin(buffer), [wrapped | scope], state)
   end
 
-  defp generate_buffer([{ :end_expr, line, _, chars }|t], buffer, [current|_], state) do
-    { wrapped, state } = wrap_expr(current, line, buffer, chars, state)
-    tuples = maybe_block :elixir_translator.forms!(wrapped, state.start_line, state.file, [])
-    buffer = insert_quotes(tuples, state.dict)
-    { buffer, t }
+  defp generate_buffer(
+         [{:middle_expr, line, column, modifier, chars} | t],
+         buffer,
+         [_ | _] = scope,
+         state
+       ) do
+    message =
+      "unexpected beginning of EEx tag \"<%#{modifier}\" on \"<%#{modifier}#{chars}%>\", " <>
+        "please remove \"#{modifier}\" accordingly"
+
+    :elixir_errors.erl_warn(line, state.file, message)
+    generate_buffer([{:middle_expr, line, column, '', chars} | t], buffer, scope, state)
+    # TODO: Make this an error on Elixir v2.0 since it accidentally worked previously.
+    # raise EEx.SyntaxError, message: message, file: state.file, line: line
   end
 
-  defp generate_buffer([{ :end_expr, line, _, chars }|_], _buffer, [], _state) do
-    raise EEx.SyntaxError, message: "unexpected token: #{inspect chars} at line #{inspect line}"
+  defp generate_buffer([{:middle_expr, line, column, _, chars} | _], _buffer, [], state) do
+    raise EEx.SyntaxError,
+      message: "unexpected middle of expression <%#{chars}%>",
+      file: state.file,
+      line: line,
+      column: column
   end
 
-  defp generate_buffer([], buffer, [], _state) do
-    buffer
+  defp generate_buffer(
+         [{:end_expr, line, _column, '', chars} | rest],
+         buffer,
+         [current | _],
+         state
+       ) do
+    {wrapped, state} = wrap_expr(current, line, buffer, chars, state)
+    column = state.start_column
+    options = [file: state.file, line: state.start_line, column: column] ++ state.parser_options
+    tuples = Code.string_to_quoted!(wrapped, options)
+    buffer = insert_quoted(tuples, state.quoted)
+    {buffer, rest}
   end
 
-  defp generate_buffer([], _buffer, _scope, _state) do
-    raise EEx.SyntaxError, message: "unexpected end of string. expecting a closing <% end %>."
+  defp generate_buffer(
+         [{:end_expr, line, column, modifier, chars} | t],
+         buffer,
+         [_ | _] = scope,
+         state
+       ) do
+    message =
+      "unexpected beginning of EEx tag \"<%#{modifier}\" on end of " <>
+        "expression \"<%#{modifier}#{chars}%>\", please remove \"#{modifier}\" accordingly"
+
+    :elixir_errors.erl_warn(line, state.file, message)
+    generate_buffer([{:end_expr, line, column, '', chars} | t], buffer, scope, state)
+    # TODO: Make this an error on Elixir v2.0 since it accidentally worked previously.
+    # raise EEx.SyntaxError, message: message, file: state.file, line: line, column: column
+  end
+
+  defp generate_buffer([{:end_expr, line, column, _, chars} | _], _buffer, [], state) do
+    raise EEx.SyntaxError,
+      message: "unexpected end of expression <%#{chars}%>",
+      file: state.file,
+      line: line,
+      column: column
+  end
+
+  defp generate_buffer([{:eof, _, _}], buffer, [], state) do
+    state.engine.handle_body(buffer)
+  end
+
+  defp generate_buffer([{:eof, line, column}], _buffer, _scope, state) do
+    raise EEx.SyntaxError,
+      message: "unexpected end of string, expected a closing '<% end %>'",
+      file: state.file,
+      line: line,
+      column: column
   end
 
   # Creates a placeholder and wrap it inside the expression block
 
   defp wrap_expr(current, line, buffer, chars, state) do
     new_lines = List.duplicate(?\n, line - state.line)
+    key = length(state.quoted)
+    placeholder = '__EEX__(' ++ Integer.to_charlist(key) ++ ');'
+    count = current ++ placeholder ++ new_lines ++ chars
+    new_state = %{state | quoted: [{key, state.engine.handle_end(buffer)} | state.quoted]}
 
-    if state.dict == [] and is_empty?(buffer) do
-      { current ++ new_lines ++ chars, state }
+    {count, new_state}
+  end
+
+  # Look middle expressions that immediately follow a start_expr
+
+  defp look_ahead_middle(
+         [{:text, _, _, text}, {:middle_expr, line, _, _, chars} | rest] = tokens,
+         start,
+         contents
+       ) do
+    if only_spaces?(text) do
+      {contents ++ text ++ chars, line, rest}
     else
-      key = length(state.dict)
-      placeholder = '__EEX__(' ++ integer_to_list(key) ++ ');'
-      { current ++ placeholder ++ new_lines ++ chars, state.update_dict(&[{key, buffer}|&1]) }
+      {contents, start, tokens}
     end
   end
 
-  # Check if the syntax node represents an empty string
-
-  defp is_empty?(bin) when is_binary(bin) do
-    bc(<<c>> inbits bin, not c in [?\s, ?\t, ?\r, ?\n], do: <<c>>) == ""
+  defp look_ahead_middle([{:middle_expr, line, _column, _, chars} | rest], _start, contents) do
+    {contents ++ chars, line, rest}
   end
 
-  defp is_empty?({ :<>, _, [left, right] }) do
-    is_empty?(left) and is_empty?(right)
+  defp look_ahead_middle(tokens, start, contents) do
+    {contents, start, tokens}
   end
 
-  defp is_empty?(_) do
-    false
+  defp only_spaces?(chars) do
+    Enum.all?(chars, &(&1 in [?\s, ?\t, ?\r, ?\n]))
   end
-
-  # Block wrapping
-
-  defp maybe_block([]),    do: nil
-  defp maybe_block([h]),   do: h
-  defp maybe_block(other), do: { :__block__, [], other }
 
   # Changes placeholder to real expression
 
-  defp insert_quotes({ :__EEX__, _, [key] }, dict) do
-    { ^key, value } = List.keyfind dict, key, 0
+  defp insert_quoted({:__EEX__, _, [key]}, quoted) do
+    {^key, value} = List.keyfind(quoted, key, 0)
     value
   end
 
-  defp insert_quotes({ left, line, right }, dict) do
-    { insert_quotes(left, dict), line, insert_quotes(right, dict) }
+  defp insert_quoted({left, line, right}, quoted) do
+    {insert_quoted(left, quoted), line, insert_quoted(right, quoted)}
   end
 
-  defp insert_quotes({ left, right }, dict) do
-    { insert_quotes(left, dict), insert_quotes(right, dict) }
+  defp insert_quoted({left, right}, quoted) do
+    {insert_quoted(left, quoted), insert_quoted(right, quoted)}
   end
 
-  defp insert_quotes(list, dict) when is_list(list) do
-    Enum.map list, &insert_quotes(&1, dict)
+  defp insert_quoted(list, quoted) when is_list(list) do
+    Enum.map(list, &insert_quoted(&1, quoted))
   end
 
-  defp insert_quotes(other, _dict) do
+  defp insert_quoted(other, _quoted) do
     other
+  end
+
+  defp column(column, mark) do
+    # length('<%') == 2
+    column + 2 + length(mark)
   end
 end

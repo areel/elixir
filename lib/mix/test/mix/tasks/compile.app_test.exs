@@ -1,21 +1,49 @@
-Code.require_file "../../test_helper.exs", __DIR__
+Code.require_file("../../test_helper.exs", __DIR__)
 
 defmodule Mix.Tasks.Compile.AppTest do
   use MixTest.Case
 
-  defmodule SimpleProject do
-    def project do
-      [app: :simple_project, version: "0.1.0"]
-    end
-  end
-
   defmodule CustomProject do
     def project do
-      [app: :custom_project, version: "0.2.0"]
+      [
+        app: :custom_project,
+        version: "0.2.0",
+        description: "Some UTF-8 dëscriptión"
+      ]
     end
 
     def application do
-      [maxT: :infinity]
+      [
+        maxT: :infinity,
+        applications: [:example_app, mix: :optional],
+        extra_applications: [:logger, ex_unit: :optional]
+      ]
+    end
+  end
+
+  defmodule CustomDeps do
+    def project do
+      [app: :custom_deps, version: "0.2.0", deps: deps()]
+    end
+
+    def application do
+      [extra_applications: [:logger], included_applications: [:ok9]]
+    end
+
+    def deps do
+      [
+        {:ok1, path: "../ok"},
+        {:ok2, path: "../ok", only: :prod},
+        {:ok3, path: "../ok", only: :dev},
+        {:ok4, path: "../ok", runtime: true},
+        {:ok5, path: "../ok", runtime: false},
+        {:ok6, path: "../ok", optional: true},
+        {:ok7, path: "../ok", optional: false},
+        {:ok8, path: "../ok", app: false},
+        {:ok9, path: "../ok"},
+        {:ok10, path: "../ok", targets: [:will_never_be_listed]},
+        {:ok11, path: "../ok", targets: [Mix.target()]}
+      ]
     end
   end
 
@@ -25,93 +53,217 @@ defmodule Mix.Tasks.Compile.AppTest do
     end
 
     def application do
-      case Process.get(:error) do
-        :modules -> [modules: :invalid]
-        :maxT -> [maxT: :invalid]
-        :registered -> [registered: ["invalid"]]
-        :included_applications -> [included_applications: ["invalid"]]
-        :applications -> [applications: ["invalid"]]
-        :env -> [env: [:a]]
-        :mod -> [mod: {Mod}]
-        :start_phases -> [start_phases: [:invalid]]
-      end
+      Process.get(:application)
+    end
+  end
+
+  defmodule InvalidVsnProject do
+    def project do
+      [app: :invalid_vsn_project, version: "0.3"]
     end
   end
 
   test "generates .app file when changes happen" do
-    Mix.Project.push SimpleProject
+    Mix.Project.push(MixTest.Case.Sample)
 
-    in_fixture "no_mixfile", fn ->
+    in_fixture("no_mixfile", fn ->
       Mix.Tasks.Compile.Elixir.run([])
-      assert Mix.Tasks.Compile.App.run([]) == :ok
+      assert Mix.Tasks.Compile.App.run([]) == {:ok, []}
 
-      contents = File.read!("ebin/simple_project.app")
-      assert contents =~ "{application,simple_project"
-      assert contents =~ "0.1.0"
-      assert contents =~ "'Elixir.A'"
-      assert contents =~ "{applications,[kernel,stdlib,elixir]}"
+      properties = parse_resource_file(:sample)
+      assert properties[:vsn] == '0.1.0'
+      assert properties[:modules] == [A, B]
+      assert properties[:applications] == [:kernel, :stdlib, :elixir]
+      refute Keyword.has_key?(properties, :compile_env)
 
-      assert Mix.Tasks.Compile.App.run([]) == :noop
-    end
-  after
-    Mix.Project.pop
+      assert Mix.Tasks.Compile.App.run([]) == {:noop, []}
+    end)
   end
 
-  test "use custom application settings" do
-    Mix.Project.push CustomProject
+  test "generates .app file with compile_env" do
+    Mix.Project.push(MixTest.Case.Sample)
 
-    in_fixture "no_mixfile", fn ->
+    in_fixture("no_mixfile", fn ->
+      Mix.ProjectStack.compile_env([{:app, :key, :error}])
+      assert Mix.Tasks.Compile.App.run([]) == {:ok, []}
+      assert parse_resource_file(:sample)[:compile_env] == [{:app, :key, :error}]
+
+      # No-op with untouched unset compile_env
+      assert Mix.Tasks.Compile.App.run([]) == {:noop, []}
+
+      # No-op with same compile_env
+      Mix.ProjectStack.compile_env([{:app, :key, :error}])
+      assert Mix.Tasks.Compile.App.run([]) == {:noop, []}
+
+      # Recompiles with new compile_env
+      Mix.ProjectStack.compile_env([{:app, :another, :error}])
+      assert Mix.Tasks.Compile.App.run([]) == {:ok, []}
+      assert parse_resource_file(:sample)[:compile_env] == [{:app, :another, :error}]
+
+      # Keeps compile_env if forcing
+      assert Mix.Tasks.Compile.App.run(["--force"]) == {:ok, []}
+      assert parse_resource_file(:sample)[:compile_env] == [{:app, :another, :error}]
+    end)
+  end
+
+  test "uses custom application settings" do
+    Mix.Project.push(CustomProject)
+
+    in_fixture("no_mixfile", fn ->
       Mix.Tasks.Compile.Elixir.run([])
       Mix.Tasks.Compile.App.run([])
-      contents = File.read!("ebin/custom_project.app")
-      assert contents =~ "0.2.0"
-      assert contents =~ "{maxT,infinity}"
-    end
-  after
-    Mix.Project.pop
+
+      properties = parse_resource_file(:custom_project)
+      assert properties[:vsn] == '0.2.0'
+      assert properties[:maxT] == :infinity
+      assert properties[:applications] == [:kernel, :stdlib, :elixir, :logger, :example_app]
+      assert properties[:description] == 'Some UTF-8 dëscriptión'
+      refute Keyword.has_key?(properties, :extra_applications)
+    end)
   end
 
-  test "application properties validation" do
-    Mix.Project.push InvalidProject
+  test "infers applications" do
+    Mix.Project.push(CustomDeps)
 
-    in_fixture "no_mixfile", fn ->
-      lc error inlist [:modules, :maxT, :registered, :included_applications,
-                   :applications, :env, :mod, :start_phases] do
-        Process.put(:error, error)
-        e = catch_error(Mix.Tasks.Compile.App.run([]))
-        assert Mix.Error[] = e
-        assert e.message =~ ":#{error}"
+    in_fixture("no_mixfile", fn ->
+      Mix.Tasks.Compile.Elixir.run([])
+      Mix.Tasks.Compile.App.run([])
 
-        err_token = InvalidProject.application[error]
-        cond do
-          is_list(err_token) ->
-            [tok] = err_token
-            assert e.message =~ inspect(tok)
-          true ->
-            assert e.message =~ inspect(err_token)
-        end
+      properties = parse_resource_file(:custom_deps)
+
+      assert properties[:applications] ==
+               [:kernel, :stdlib, :elixir, :logger, :ok1, :ok3, :ok4, :ok7, :ok11]
+    end)
+  end
+
+  test "validates properties" do
+    Mix.Project.push(InvalidProject)
+
+    in_fixture("no_mixfile", fn ->
+      Process.put(:application, [:not_a_keyword, applications: []])
+      message = "Application configuration returned from application/0 should be a keyword list"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
       end
-      Process.delete(:error)
-    end
-  after
-    Mix.Project.pop
+
+      Process.put(:application, modules: :invalid)
+      message = "Application modules (:modules) should be a list of atoms, got: :invalid"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, maxT: :invalid)
+      message = "Application maximum time (:maxT) is not an integer or :infinity, got: :invalid"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, registered: ["invalid"])
+
+      message =
+        "Application registered processes (:registered) should be a list of atoms, got: [\"invalid\"]"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, extra_applications: ["invalid"])
+
+      message =
+        "Application extra applications (:extra_applications) should be a list of atoms or {app, :required | :optional} pairs, got: [\"invalid\"]"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, included_applications: ["invalid"])
+
+      message =
+        "Application included applications (:included_applications) should be a list of atoms, got: [\"invalid\"]"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, applications: ["invalid"])
+
+      message =
+        "Application applications (:applications) should be a list of atoms or {app, :required | :optional} pairs, got: [\"invalid\"]"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, applications: nil)
+
+      message =
+        "Application applications (:applications) should be a list of atoms or {app, :required | :optional} pairs, got: nil"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, env: [:invalid])
+      message = "Application environment (:env) should be a keyword list, got: [:invalid]"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, mod: {Mod})
+
+      message =
+        "Application callback module (:mod) should be either [] or {module, start_args}, got: {Mod}"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+
+      Process.put(:application, start_phases: [:invalid])
+
+      message =
+        "Application start phases (:start_phases) should be a keyword list, got: [:invalid]"
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+    end)
   end
 
   test ".app contains description and registered (as required by systools)" do
-    Mix.Project.push SimpleProject
+    Mix.Project.push(MixTest.Case.Sample)
 
-    in_fixture "no_mixfile", fn ->
+    in_fixture("no_mixfile", fn ->
       Mix.Tasks.Compile.Elixir.run([])
-      assert Mix.Tasks.Compile.App.run([]) == :ok
+      assert Mix.Tasks.Compile.App.run([]) == {:ok, []}
 
-      {:ok, [{_app, _, properties}]} = :file.consult("ebin/simple_project.app")
-      properties = Keyword.from_enum(properties)
+      properties = parse_resource_file(:sample)
       assert properties[:registered] == []
-      assert properties[:description] == 'simple_project'
+      assert properties[:description] == 'sample'
+      assert properties[:applications] == [:kernel, :stdlib, :elixir]
 
-      assert Mix.Tasks.Compile.App.run([]) == :noop
-    end
-  after
-    Mix.Project.pop
+      assert Mix.Tasks.Compile.App.run([]) == {:noop, []}
+    end)
+  end
+
+  test "raises on invalid version" do
+    Mix.Project.push(InvalidVsnProject)
+
+    in_fixture("no_mixfile", fn ->
+      message = ~r"Expected :version to be a valid Version, got: \"0.3\""
+
+      assert_raise Mix.Error, message, fn ->
+        Mix.Tasks.Compile.App.run([])
+      end
+    end)
+  end
+
+  defp parse_resource_file(app) do
+    {:ok, [term]} = :file.consult("_build/dev/lib/#{app}/ebin/#{app}.app")
+    {:application, ^app, properties} = term
+    properties
   end
 end

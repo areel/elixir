@@ -1,59 +1,79 @@
 defmodule Mix.SCM do
-  use Behaviour
-
-  @typep opts :: [{ atom, any }]
-  @typep lock
-
   @moduledoc """
   This module provides helper functions and defines the
-  behavior required by any SCM used by mix.
+  behaviour required by any source code manager (SCM) used by Mix.
   """
 
-  @doc """
-  Returns an Elixir term that contains relevant SCM
-  information for printing.
+  @typedoc """
+  A module implementing the `Mix.SCM` behaviour.
   """
-  defcallback format(opts) :: term
+  @type t :: module
+
+  @type opts :: keyword
 
   @doc """
-  Returns an Elixir term that contains relevant SCM
-  lock information for printing.
+  Returns a boolean if the dependency can be fetched
+  or it is meant to be previously available in the
+  file system.
+
+  Local dependencies (i.e. non-fetchable ones) are automatically
+  recompiled every time the parent project is compiled.
   """
-  defcallback format_lock(lock) :: term
+  @callback fetchable? :: boolean
 
   @doc """
-  This behavior function receives a keyword list of `opts`
+  Returns a string representing the SCM. This is used
+  when printing the dependency and not for inspection,
+  so the amount of information should be concise and
+  easy to spot.
+  """
+  @callback format(opts) :: String.t()
+
+  @doc """
+  Returns a string representing the SCM. This is used
+  when printing the dependency and not for inspection,
+  so the amount of information should be concise and
+  easy to spot.
+
+  If nil is returned, it means no lock information is available.
+  """
+  @callback format_lock(opts) :: String.t() | nil
+
+  @doc """
+  This behaviour function receives a keyword list of `opts`
   and should return an updated list in case the SCM consumes
   the available options. For example, when a developer specifies
   a dependency:
 
-      { :foo, "0.1.0", github: "foo/bar" }
+      {:foo, "0.1.0", github: "foo/bar"}
 
   Each registered SCM will be asked if they consume this dependency,
-  receiving [github: "foo/bar"] as argument. Since this option makes
+  receiving `[github: "foo/bar"]` as argument. Since this option makes
   sense for the Git SCM, it will return an update list of options
-  while other SCMs would simply return nil.
+  while other SCMs would simply return `nil`.
   """
-  defcallback accepts_options(app :: atom, opts) :: opts | nil
+  @callback accepts_options(app :: atom, opts) :: opts | nil
 
   @doc """
-  This behavior function returns a boolean if the
+  This behaviour function returns a boolean if the
   dependency is available.
   """
-  defcallback checked_out?(opts) :: boolean
+  @callback checked_out?(opts) :: boolean
 
   @doc """
-  This behavior function checks out dependencies.
+  This behaviour function checks out dependencies.
 
   If the dependency is locked, a lock is received in `opts`
   and the repository must be check out at the lock. Otherwise,
   no lock is given and the repository can be checked out
   to the latest version.
+
+  It must return the current lock.
   """
-  defcallback checkout(opts) :: any
+  @callback checkout(opts) :: any
 
   @doc """
-  This behavior function updates dependencies. It may be
+  This behaviour function updates dependencies. It may be
   called by `deps.get` or `deps.update`.
 
   In the first scenario, a lock is received in `opts` and
@@ -62,47 +82,67 @@ defmodule Mix.SCM do
 
   It must return the current lock.
   """
-  defcallback update(opts) :: any
+  @callback update(opts) :: any
 
   @doc """
-  This behavior function checks if the dependency is locked and
-  the current repository version matches the lock. Note that some
-  SCMs do not require a lock, for such, this function can simply
-  return true.
+  This behaviour function checks the status of the lock. In
+  particular, it checks if the revision stored in the lock
+  is the same as the repository it is currently in.
+
+  It may return:
+
+    * `:mismatch` - if the lock doesn't match and we need to
+      simply move to the latest lock
+
+    * `:outdated` - the repository options are outdated in the
+      lock and we need to trigger a full update
+
+    * `:ok` - everything is fine
+
+  The lock is sent via `opts[:lock]` but it may not always be
+  available. In such cases, if the SCM requires a lock, it must
+  return `:mismatch`, otherwise simply `:ok`.
+
+  Note the lock may also belong to another SCM and as such, an
+  structural check is required. A structural mismatch should always
+  return `:outdated`.
   """
-  defcallback matches_lock?(opts) :: boolean
+  @callback lock_status(opts) :: :mismatch | :outdated | :ok
 
   @doc """
-  Receives two options and must return true if the refer to the
+  Receives two options and must return `true` if they refer to the
   same repository. The options are guaranteed to belong to the
   same SCM.
   """
-  defcallback equal?(opts1 :: opts, opts2 :: opts) :: boolean
+  @callback equal?(opts1 :: opts, opts2 :: opts) :: boolean
 
   @doc """
-  This behavior function should clean the given dependency.
+  Returns the usable managers for the dependency. This can be used
+  if the SCM has extra knowledge of the dependency, otherwise it
+  should return an empty list.
   """
-  defcallback clean(opts) :: any
+  @callback managers(opts) :: [atom]
 
   @doc """
-  Returns all available SCM.
+  Returns all available SCMs. Each SCM is tried in order
+  until a matching one is found.
   """
   def available do
-    Mix.Server.call(:scm)
+    {:ok, scm} = Mix.State.fetch(:scm)
+    scm
   end
 
   @doc """
-  Register the scm repository with the given `key` and `mod`.
+  Prepends the given SCM module to the list of available SCMs.
   """
-  def register(mod) when is_atom(mod) do
-    Mix.Server.cast({ :add_scm, mod })
+  def prepend(mod) when is_atom(mod) do
+    Mix.State.prepend_scm(mod)
   end
 
   @doc """
-  Register builtin SCMs.
+  Appends the given SCM module to the list of available SCMs.
   """
-  def register_builtin do
-    register Mix.SCM.Git
-    register Mix.SCM.Path
+  def append(mod) when is_atom(mod) do
+    Mix.State.append_scm(mod)
   end
 end

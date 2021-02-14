@@ -1,43 +1,36 @@
 defmodule Mix.Tasks.Archive do
   use Mix.Task
 
-  @shortdoc "Archive this project into a .ez file"
+  @shortdoc "Lists installed archives"
 
   @moduledoc """
-  Packages the current project (though not its dependencies) into a
-  zip file according to the specification of the
-  [Erlang Archive Format](http://www.erlang.org/doc/man/code.html).
+  Lists all installed archives.
 
-  Archives are meant to bundle small projects, usually installed
-  locally.
+  Archives are typically installed at `~/.mix/archives`
+  although the installation path can be customized by
+  setting the `MIX_ARCHIVES` environment variable.
 
-  The file will be created in the current directory (which is expected
-  to be the project root), unless an argument -o is provided with the file name.
-
-  ## Command line options
-
-  * `-o` - specify output file name
-  * `--no-compile` - skip compilation
-
+  Since archives are specific to Elixir versions, it is
+  expected from build tools to swap the `MIX_ARCHIVES`
+  variable to different locations based on a particular
+  Elixir installation.
   """
 
-  def run(args) do
-    { opts, _, _ } = OptionParser.parse(args, switches: [force: :boolean, no_compile: :boolean])
+  @impl true
+  def run(_) do
+    Mix.path_for(:archives)
+    |> Path.join("*")
+    |> Path.wildcard()
+    |> Enum.map(&Path.basename/1)
+    |> print()
+  end
 
-    unless opts[:no_compile] do
-      Mix.Task.run :compile, args
-    end
+  defp print([]) do
+    Mix.shell().info("No archives currently installed.")
+  end
 
-    archive_file = cond do
-      o = opts[:o] ->
-        o
-      app = Mix.project[:app] ->
-        Mix.Archive.name(app, Mix.project[:version])
-      true ->
-        raise Mix.Error, message: "Could not create archive without a name, " <>
-          "please pass -o as an option"
-    end
-
-    Mix.Archive.create(archive_file)
+  defp print(items) do
+    Enum.each(items, fn item -> Mix.shell().info(["* ", item]) end)
+    Mix.shell().info("Archives installed at: #{Mix.path_for(:archives)}")
   end
 end

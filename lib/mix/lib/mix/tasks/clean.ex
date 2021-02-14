@@ -1,29 +1,61 @@
 defmodule Mix.Tasks.Clean do
   use Mix.Task
 
-  @shortdoc "Clean generated application files"
+  @shortdoc "Deletes generated application files"
   @recursive true
 
   @moduledoc """
-  Clean generated application files.
+  Deletes generated application files.
 
-  ## Command line options
+  This command deletes all build artifacts for the current project.
+  Dependencies' sources and build files are cleaned only if the
+  `--deps` option is given.
 
-  * `--all` - Clean everything, including dependencies
-
+  By default this task works across all environments, unless `--only`
+  is given.
   """
+
+  @switches [deps: :boolean, only: :string]
+
+  @impl true
   def run(args) do
-    { opts, _, _ } = OptionParser.parse(args)
+    Mix.Project.get!()
+    loadpaths!()
 
-    manifests = Mix.Tasks.Compile.manifests
-    Enum.each(manifests, fn(manifest) ->
-      Enum.each Mix.Utils.read_manifest(manifest),
-                &(&1 |> String.split("\t") |> hd |> File.rm)
-      File.rm(manifest)
-    end)
+    {opts, _, _} = OptionParser.parse(args, switches: @switches)
 
-    File.rm_rf(Mix.project[:compile_path])
+    # First we get the tasks and then we clean them.
+    # This is to avoid a task cleaning a compiler module.
+    tasks =
+      for compiler <- [:protocols] ++ Mix.Tasks.Compile.compilers(),
+          module = Mix.Task.get("compile.#{compiler}"),
+          function_exported?(module, :clean, 0),
+          do: module
 
-    if opts[:all], do: Mix.Task.run("deps.clean", args)
+    Enum.each(tasks, & &1.clean())
+
+    build =
+      Mix.Project.build_path()
+      |> Path.dirname()
+      |> Path.join("*#{opts[:only]}")
+
+    if opts[:deps] do
+      build
+      |> Path.wildcard()
+      |> Enum.each(&File.rm_rf/1)
+    else
+      build
+      |> Path.join("lib/#{Mix.Project.config()[:app]}")
+      |> Path.wildcard()
+      |> Enum.each(&File.rm_rf/1)
+    end
+  end
+
+  # Loadpaths without checks because compilers may be defined in deps.
+  defp loadpaths! do
+    options = ["--no-elixir-version-check", "--no-deps-check", "--no-archives-check"]
+    Mix.Task.run("loadpaths", options)
+    Mix.Task.reenable("loadpaths")
+    Mix.Task.reenable("deps.loadpaths")
   end
 end

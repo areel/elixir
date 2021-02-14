@@ -1,309 +1,160 @@
 defmodule Mix.Tasks.Compile.Elixir do
-  # The ManifestCompiler is a convenience that tracks dependencies
-  # in between files and recompiles them as they change recursively.
-  defmodule ManifestCompiler do
-    use GenServer.Behaviour
-    @moduledoc false
+  use Mix.Task.Compiler
 
-    def files_to_path(manifest, stale, all, compile_path, on_start) do
-      all_entries = read_manifest(manifest)
-
-      # Each entry that is not in all must be removed
-      entries = lc { beam, _m, source, _d } = entry inlist all_entries,
-                   is_in_list_or_remove(source, all, beam),
-                   do: entry
-
-      outsider = Enum.any?(stale, &not(&1 in all))
-
-      stale =
-        if outsider do
-          # Outsider files trigger whole compilation
-          all
-        else
-          # Otherwise compile only stale. Also add each entry
-          # in all that's not in the manifest is also stale
-          stale ++ lc i inlist all,
-                      not Enum.any?(entries, fn { _b, _m, s, _d } -> s == i end),
-                      do: i
-        end
-
-      cond do
-        stale != [] ->
-          on_start.()
-          { :ok, pid } = :gen_server.start_link(__MODULE__, entries, [])
-
-          try do
-            do_files_to_path(pid, entries, stale, compile_path, System.cwd)
-            :gen_server.cast(pid, :merge)
-          after
-            :gen_server.call(pid, { :stop, manifest })
-          end
-
-          :ok
-        all_entries != entries ->
-          :ok
-        true ->
-          :noop
-      end
-    end
-
-    defp is_in_list_or_remove(source, all, beam) do
-      if source in all do
-        true
-      else
-        File.rm(beam)
-        false
-      end
-    end
-
-    defp do_files_to_path(_pid, _entries, [], _compile_path, _cwd), do: :ok
-    defp do_files_to_path(pid, entries, files, compile_path, cwd) do
-      Kernel.ParallelCompiler.files :lists.usort(files),
-        each_module: &each_module(pid, compile_path, cwd, &1, &2, &3),
-        each_file: &each_file(&1),
-        each_waiting: &each_waiting(entries, &1)
-
-      do_files_to_path(pid, entries, :gen_server.call(pid, :next), compile_path, cwd)
-    end
-
-    defp each_module(pid, compile_path, cwd, source, module, binary) do
-      bin  = atom_to_binary(module)
-      beam = Path.join(compile_path, bin <> ".beam")
-
-      deps = Module.DispatchTracker.aliases(module) ++
-             Module.DispatchTracker.remotes(module) ++
-             Module.DispatchTracker.imports(module)
-      deps = deps |> :lists.usort |> Enum.map(&atom_to_binary(&1))
-
-      relative = if cwd, do: Path.relative_to(source, cwd), else: source
-      :gen_server.cast(pid, { :store, beam, bin, relative, deps, binary })
-    end
-
-    defp each_file(file) do
-      Mix.shell.info "Compiled #{file}"
-    end
-
-    defp each_waiting(entries, module) do
-      module = atom_to_binary(module)
-      Enum.find_value(entries, fn
-        { _b, m, s, _d } when m == module -> s
-        _ -> nil
-      end)
-    end
-
-    # Reads the manifest returning the results as tuples.
-    # The beam files are read, removed and stored in memory.
-    defp read_manifest(manifest) do
-      Enum.reduce Mix.Utils.read_manifest(manifest), [], fn x, acc ->
-        case String.split(x, "\t") do
-          [beam, module, source|deps] ->
-            [{ beam, module, source, deps }|acc]
-          _ ->
-            acc
-        end
-      end
-    end
-
-    # Writes the manifest separating entries by tabs.
-    defp write_manifest(manifest, entries, modules) do
-      lines = Enum.map(entries, fn
-        { beam, module, source, deps, binary } ->
-          File.write!(beam, binary)
-          deps = Enum.filter(deps, &(&1 in modules))
-          [beam, module, source | deps] |> Enum.join("\t")
-      end)
-
-      manifest && Mix.Utils.write_manifest(manifest, lines)
-    end
-
-    # Callbacks
-
-    def init(entries) do
-      entries =
-        Enum.reduce entries, [], fn
-          { beam, module, source, deps }, acc ->
-            case File.read(beam) do
-              { :ok, binary } ->
-                File.rm(beam)
-                [{ beam, module, source, deps, binary }|acc]
-              { :error, _ } ->
-                acc
-            end
-        end
-
-      { :ok, { entries, [] } }
-    end
-
-    def handle_call(:next, _from, { old, new }) do
-      modules = lc { _b, module, _s, _d, _y } inlist new, do: module
-      sources = lc { _b, _m, source, _d, _y } inlist new, do: source
-
-      # For each previous entry in the manifest that
-      # had its dependency changed and it was not yet
-      # compiled, get its source as next
-      next = lc { _b, module, source, deps, _y } inlist old,
-                Enum.any?(modules, &(&1 in deps)),
-                not(module in modules),
-                not(source in sources),
-                do: source
-
-      { :reply, next, { old, new } }
-    end
-
-    def handle_call({ :stop, manifest }, _from, { old, new }) do
-      modules = lc { _b, m, _s, _d, _y } inlist old, do: m
-      write_manifest(new == [] && manifest, old, modules)
-      { :stop, :normal, :ok, { old, new } }
-    end
-
-    def handle_call(msg, from, state) do
-      super(msg, from, state)
-    end
-
-    def handle_cast(:merge, { old, new }) do
-      merged = :lists.ukeymerge(1, :lists.sort(new), :lists.sort(old))
-      { :noreply, { merged, [] } }
-    end
-
-    def handle_cast({ :store, beam, module, source, deps, binary }, { old, new }) do
-      { :noreply, { old, :lists.keystore(beam, 1, new, { beam, module, source, deps, binary }) } }
-    end
-
-    def handle_cast(msg, state) do
-      super(msg ,state)
-    end
-  end
-
-  use Mix.Task
-  alias Mix.Tasks.Compile.Erlang
-
-  @hidden true
-  @shortdoc "Compile Elixir source files"
   @recursive true
-  @manifest ".compile.elixir"
+  @manifest "compile.elixir"
 
   @moduledoc """
-  A task to compile Elixir source files.
+  Compiles Elixir source files.
 
-  Elixir is smart enough to recompile only files that changed
+  Elixir is smart enough to recompile only files that have changed
   and their dependencies. This means if `lib/a.ex` is invoking
   a function defined over `lib/b.ex`, whenever `lib/b.ex` changes,
   `lib/a.ex` is also recompiled.
 
-  Note it is important to recompile a file dependencies because
-  often there are compilation time dependencies in between them.
+  Note it is important to recompile a file's dependencies as
+  there are often compile time dependencies between them.
+
+  ## `__mix_recompile__?/0`
+
+  A module may export a `__mix_recompile__?/0` function that can
+  cause the module to be recompiled using custom rules. For example,
+  `@external_resource` already adds a compile-time dependency on an
+  external file, however to depend on a _dynamic_ list of files we
+  can do:
+
+      defmodule MyModule do
+        paths = Path.wildcard("*.txt")
+        paths_hash = :erlang.md5(paths)
+
+        for path <- paths do
+          @external_resource path
+        end
+
+        def __mix_recompile__?() do
+          Path.wildcard("*.txt") |> :erlang.md5() != unquote(paths_hash)
+        end
+      end
+
+  Compiler calls `__mix_recompile__?/0` for every module being
+  compiled (or previously compiled) and thus it is very important
+  to do there as little work as possible to not slow down the
+  compilation.
+
+  If module has `@compile {:autoload, false}`, `__mix_recompile__?/0` will
+  not be used.
 
   ## Command line options
 
-  * `--force` - forces compilation regardless of modification times;
-  * `--no-docs` - Do not attach documentation to compiled modules;
-  * `--no-debug-info` - Do not attach debug info to compiled modules;
-  * `--ignore-module-conflict`
-  * `--warnings-as-errors` - Treat warnings as errors and return a non-zero exit code
+    * `--verbose` - prints each file being compiled
+    * `--force` - forces compilation regardless of modification times
+    * `--docs` (`--no-docs`) - attaches (or not) documentation to compiled modules
+    * `--debug-info` (`--no-debug-info`) - attaches (or not) debug info to compiled modules
+    * `--ignore-module-conflict` - does not emit warnings if a module was previously defined
+    * `--warnings-as-errors` - treats warnings in the current project as errors and
+      return a non-zero exit code
+    * `--long-compilation-threshold N` - sets the "long compilation" threshold
+      (in seconds) to `N` (see the docs for `Kernel.ParallelCompiler.compile/2`)
+    * `--profile` - if set to `time`, outputs timing information of compilation steps
+    * `--all-warnings` - prints warnings even from files that do not need to be recompiled
+    * `--tracer` - adds a compiler tracer in addition to any specified in the `mix.exs` file
 
   ## Configuration
 
-  * `:elixirc_paths` - directories to find source files.
-    Defaults to `["lib"]`, can be configured as:
+    * `:elixirc_paths` - directories to find source files.
+      Defaults to `["lib"]`.
 
-    ```
-    [elixirc_paths: ["lib", "other"]]
-    ```
+    * `:elixirc_options` - compilation options that apply to Elixir's compiler.
+      See `Code.put_compiler_option/2` for a complete list of options. These
+      options are often overridable from the command line using the switches
+      above.
 
-  * `:elixirc_options` - compilation options that apply
-     to Elixir's compiler, they are: `:ignore_module_conflict`,
-     `:docs` and `:debug_info`. By default, uses the same
-     behaviour as Elixir;
-
-  * `:elixirc_exts` - extensions to compile whenever there
-     is a change:
-
-     ```
-     [compile_exts: [:ex]]
-     ```
-
-  * `:elixirc_watch_exts` - extensions to watch in order to trigger
-      a compilation:
-
-      ```
-      [elixirc_watch_exts: [:ex, :eex]]
-      ```
+    * `[xref: [exclude: ...]]` - a list of `module` or `{module, function, arity}`
+      that should not be warned on in case on undefined modules or undefined
+      application warnings.
 
   """
 
-  @switches [ force: :boolean, docs: :boolean, warnings_as_errors: :boolean,
-              ignore_module_conflict: :boolean, debug_info: :boolean ]
+  @switches [
+    force: :boolean,
+    docs: :boolean,
+    warnings_as_errors: :boolean,
+    ignore_module_conflict: :boolean,
+    debug_info: :boolean,
+    verbose: :boolean,
+    long_compilation_threshold: :integer,
+    profile: :string,
+    all_warnings: :boolean,
+    tracer: :keep
+  ]
 
-  @doc """
-  Runs this task.
-  """
+  @impl true
   def run(args) do
-    { opts, _, _ } = OptionParser.parse(args, switches: @switches)
+    {opts, _, _} = OptionParser.parse(args, switches: @switches)
 
-    project       = Mix.project
-    compile_path  = project[:compile_path]
-    compile_exts  = project[:elixirc_exts]
-    watch_exts    = project[:elixirc_watch_exts]
-    elixirc_paths = project[:elixirc_paths]
+    project = Mix.Project.config()
+    dest = Mix.Project.compile_path(project)
+    srcs = project[:elixirc_paths]
 
-    manifest   = manifest()
-    to_compile = Mix.Utils.extract_files(elixirc_paths, compile_exts)
-    to_watch   = Mix.Utils.extract_files(elixirc_paths, watch_exts)
-    to_watch   = Mix.Project.config_files ++ Erlang.manifests ++ to_watch
-
-    stale = if opts[:force] || path_deps_changed?(manifest) do
-      to_compile
-    else
-      Mix.Utils.extract_stale(to_watch, [manifest])
+    unless is_list(srcs) do
+      Mix.raise(":elixirc_paths should be a list of paths, got: #{inspect(srcs)}")
     end
 
-    result = files_to_path(manifest, stale, to_compile, compile_path, fn ->
-      File.mkdir_p!(compile_path)
-      Code.prepend_path(compile_path)
-      set_compiler_opts(project, opts, [])
-    end)
+    manifest = manifest()
+    configs = [Mix.Project.config_mtime() | Mix.Tasks.Compile.Erlang.manifests()]
+    force = opts[:force] || Mix.Utils.stale?(configs, [manifest])
+    {tracers, opts} = pop_tracers(opts)
 
-    unless result == :noop, do: Mix.Deps.Lock.touch
-    result
+    opts =
+      (project[:elixirc_options] || [])
+      |> Keyword.merge(opts)
+      |> xref_exclude_opts(project)
+      |> tracers_opts(tracers)
+      |> profile_opts()
+
+    Mix.Compilers.Elixir.compile(manifest, srcs, dest, [:ex], force, opts)
   end
 
-  @doc """
-  Returns Elixir manifests.
-  """
-  def manifests, do: [manifest]
-  defp manifest, do: Path.join(Mix.project[:compile_path], @manifest)
+  @impl true
+  def manifests, do: [manifest()]
+  defp manifest, do: Path.join(Mix.Project.manifest_path(), @manifest)
 
-  @doc """
-  Compiles stale Elixir files.
-
-  It expects a manifest file, all stale files, all source files
-  available (including the ones that are not stale) and a path
-  where compiled files will be written to. All paths are required
-  to be relative to the current working directory.
-
-  The manifest is written down with information including dependencies
-  in between modules, which helps it recompile only the modules that
-  have changed at runtime.
-  """
-  defdelegate files_to_path(manifest, stale, all, path, on_start), to: ManifestCompiler
-
-  defp set_compiler_opts(project, opts, extra) do
-    opts = Dict.take(opts, [:docs, :debug_info, :ignore_module_conflict, :warnings_as_errors])
-    opts = Keyword.merge(project[:elixirc_options] || [], opts)
-    Code.compiler_options Keyword.merge(opts, extra)
+  @impl true
+  def clean do
+    dest = Mix.Project.compile_path()
+    Mix.Compilers.Elixir.clean(manifest(), dest)
   end
 
-  defp path_deps_changed?(manifest) do
-    manifest = Path.absname(manifest)
+  defp xref_exclude_opts(opts, project) do
+    exclude = List.wrap(project[:xref][:exclude])
 
-    deps = Enum.filter(Mix.Deps.children, fn(Mix.Dep[] = dep) ->
-      dep.scm == Mix.SCM.Path and dep.manager == :mix
-    end)
+    if exclude == [] do
+      opts
+    else
+      Keyword.update(opts, :no_warn_undefined, exclude, &(List.wrap(&1) ++ exclude))
+    end
+  end
 
-    Enum.any?(deps, fn(dep) ->
-      Mix.Deps.in_dependency(dep, fn(_) ->
-        Mix.Utils.stale?(Mix.Tasks.Compile.manifests, [manifest])
-      end)
-    end)
+  defp pop_tracers(opts) do
+    case Keyword.pop_values(opts, :tracer) do
+      {[], opts} ->
+        {[], opts}
+
+      {tracers, opts} ->
+        {Enum.map(tracers, &Module.concat([&1])), opts}
+    end
+  end
+
+  defp tracers_opts(opts, tracers) do
+    tracers = tracers ++ Code.get_compiler_option(:tracers)
+    Keyword.update(opts, :tracers, tracers, &(tracers ++ &1))
+  end
+
+  defp profile_opts(opts) do
+    case Keyword.fetch(opts, :profile) do
+      {:ok, "time"} -> Keyword.put(opts, :profile, :time)
+      {:ok, _} -> Keyword.delete(opts, :profile)
+      :error -> opts
+    end
   end
 end
